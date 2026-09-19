@@ -5,11 +5,12 @@ from ortools.sat.python import cp_model
 
 app = FastAPI()
 
+# --- リクエストデータの型定義 ---
 class Teacher(BaseModel):
     id: int
     name: str
     subject: str
-    classes: List[str]  # 例: ["1-1", "2-1"]
+    classes: List[str]  # 例: ["1-1", "1-2"]
     hours: int
 
 class NGItem(BaseModel):
@@ -39,7 +40,7 @@ def optimize_timetable(data: RequestData):
     opts = data.options or Options()
 
     # --- 1. 変数定義 ---
-    # x[(t_id, class_name, d, p)] = 1 / 0
+    # x[(t_id, class_name, d, p)] = 1 (授業あり) / 0 (授業なし)
     x = {}
     for t in teachers:
         for c in t.classes:
@@ -47,16 +48,16 @@ def optimize_timetable(data: RequestData):
                 for p in range(len(PERIODS)):
                     x[(t.id, c, d, p)] = model.NewBoolVar(f'x_{t.id}_{c}_{d}_{p}')
 
-    # --- 2. 基本ハード制約 ---
-    
-    # (A) 各データ行（教科・クラス単位）の指定コマ数を満たす
+    # --- 2. 必須（ハード）制約 ---
+
+    # (A) 各教科・各クラスの指定コマ数を満たす
     for t in teachers:
         for c in t.classes:
             model.Add(
                 sum(x[(t.id, c, d, p)] for d in range(len(DAYS)) for p in range(len(PERIODS))) == t.hours
             )
 
-    # ★重要改修(B) 教員の重複禁止（教員名 t.name 単位で集約してダブルブッキングを防ぐ）
+    # (B) 教員の重複禁止（教員名 t.name で集約して同コマ重複を防ぐ）
     teacher_name_map: Dict[str, List[tuple]] = {}
     teacher_total_hours: Dict[str, int] = {}
 
@@ -72,12 +73,12 @@ def optimize_timetable(data: RequestData):
     for t_name, tc_list in teacher_name_map.items():
         for d in range(len(DAYS)):
             for p in range(len(PERIODS)):
-                # 同一教員は、同じ曜日・時限に最大1コマ（国語と学活が被るのを防ぐ）
+                # 同一教員は同じ曜日・時限に最大1コマ（例：佐藤先生の国語と道徳が重ならない）
                 model.Add(
                     sum(x[(t_id, c, d, p)] for (t_id, c) in tc_list) <= 1
                 )
 
-    # (C) クラスの重複禁止（1つのクラスは同じ曜日・時限に1コマのみ）
+    # (C) クラスの重複禁止（1つのクラスに同じコマで2つ以上の授業が入らない）
     class_teachers_map: Dict[str, List[tuple]] = {}
     for t in teachers:
         for c in t.classes:
@@ -92,7 +93,7 @@ def optimize_timetable(data: RequestData):
                     sum(x[(t_id, cls_name, d, p)] for (t_id, cls_name) in tc_list) <= 1
                 )
 
-    # (D) NG設定の適用
+    # (D) NG設定（不可曜日・時限の適用）
     day_map = {d: i for i, d in enumerate(DAYS)}
     for ng in ng_list:
         if ng.day in day_map:
@@ -106,9 +107,9 @@ def optimize_timetable(data: RequestData):
                             for c in t.classes:
                                 model.Add(x[(t.id, c, d_idx, p_idx)] == 0)
 
-    # --- 3. ソフト制約（分散・平準化・同日上限） ---
+    # --- 3. 調整（ソフト）制約 ---
 
-    # (E) 1日あたりの同一教科上限（各クラスで同一教科は1日 max_per_day コマまで）
+    # (E) 1日あたりの同一教科上限（各クラスで同じ教科は1日 max_per_day コマまで）
     max_per_day = opts.max_per_day or 1
     for c, tc_list in class_teachers_map.items():
         subj_map: Dict[str, List[tuple]] = {}
@@ -124,7 +125,7 @@ def optimize_timetable(data: RequestData):
                     sum(x[(t_id, cls_name, d, p)] for (t_id, cls_name) in list_pairs for p in range(len(PERIODS))) <= max_per_day
                 )
 
-    # (F) 3コマ以上連続授業の禁止（クラス単位）
+    # (F) 3コマ以上連続授業の禁止（生徒側の負担軽減）
     max_consecutive = opts.max_consecutive or 2
     for c, tc_list in class_teachers_map.items():
         for d in range(len(DAYS)):
@@ -133,7 +134,7 @@ def optimize_timetable(data: RequestData):
                     sum(x[(t_id, cls_name, d, p + k)] for (t_id, cls_name) in tc_list for k in range(max_consecutive + 1)) <= max_consecutive
                 )
 
-    # ★重要改修(G) 曜日ごとのコマ数平準化（教員の合計持ちコマ数ベースで計算）
+    # (G) 曜日ごとのコマ数平準化
     if opts.balance_days:
         for t_name, tc_list in teacher_name_map.items():
             tot_h = teacher_total_hours[t_name]
@@ -158,9 +159,9 @@ def optimize_timetable(data: RequestData):
 
         model.Minimize(max_day_load - min_day_load)
 
-    # --- 4. 実行 ---
+    # --- 4. 実行・解答取得 ---
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 20.0
+    solver.parameters.max_time_in_seconds = 20.0  # 探索タイムアウト 20秒
     status = solver.Solve(model)
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -184,7 +185,7 @@ def optimize_timetable(data: RequestData):
     elif status == cp_model.INFEASIBLE:
         return {
             "status": "INFEASIBLE",
-            "message": "条件を満たす時間割が存在しません。持ちコマ数やNG設定を緩めて再試行してください。"
+            "message": "条件を満たす時間割が存在しません。各クラスの合計コマ数が週30コマを超えていないか、NG設定を緩和して再試行してください。"
         }
     else:
         return {
