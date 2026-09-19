@@ -64,6 +64,12 @@ def solve_timetable(data: InputData):
                     if (c, t_id, s_idx) in x:
                         model.Add(x[(c, t_id, s_idx)] == 0)
 
+    # 【重要追加】制約4: 各担当授業の指定コマ数（hours）を確実に割り当てる
+    for t in teachers:
+        target_hours = t.get("hours", 4)
+        for c in t.get("classes", []):
+            model.Add(sum(x[(c, t["id"], s_idx)] for s_idx in range(len(slots))) == target_hours)
+
     # ソルバーの実行（制限時間30秒）
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30.0
