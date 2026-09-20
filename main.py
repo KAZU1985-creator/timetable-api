@@ -1,194 +1,140 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 from ortools.sat.python import cp_model
 
-app = FastAPI()
-
-# --- リクエストデータの型定義 ---
-class Teacher(BaseModel):
-    id: int
-    name: str
-    subject: str
-    classes: List[str]  # 例: ["1-1", "1-2"]
-    hours: int
-
-class NGItem(BaseModel):
-    teacher_id: int
-    day: str
-    period: str
-
-class Options(BaseModel):
-    max_per_day: Optional[int] = 1
-    max_consecutive: Optional[int] = 2
-    balance_days: Optional[bool] = True
-
-class RequestData(BaseModel):
-    teachers: List[Teacher]
-    ngList: Optional[List[NGItem]] = []
-    options: Optional[Options] = Options()
+app = FastAPI(title="時間割自動生成API (29コマ対応版)")
 
 DAYS = ['月', '火', '水', '木', '金']
 PERIODS = [1, 2, 3, 4, 5, 6]
 
-@app.post("/optimize")
-def optimize_timetable(data: RequestData):
-    model = cp_model.CpModel()
-    
-    teachers = data.teachers
-    ng_list = data.ngList or []
-    opts = data.options or Options()
+class TeacherInput(BaseModel):
+    id: int
+    name: str
+    subject: str
+    classes: List[str]
+    hours: int  # 1クラスあたりの週コマ数
 
-    # --- 1. 変数定義 ---
-    # x[(t_id, class_name, d, p)] = 1 (授業あり) / 0 (授業なし)
+class NgSlot(BaseModel):
+    target_type: str  # 'teacher' または 'class'
+    target_id: str    # 教員ID(str) または クラス名
+    day: str          # '月', '火', ...
+    period: int       # 1 ~ 6
+
+class OptimizeRequest(BaseModel):
+    teachers: List[TeacherInput]
+    ng_list: Optional[List[NgSlot]] = []
+    max_consecutive: Optional[int] = 2  # 教員の最大連続授業数（デフォルト2）
+    time_limit: Optional[float] = 30.0  # タイムアウト時間（秒）
+
+@app.post("/optimize")
+def optimize_schedule(req: OptimizeRequest):
+    model = cp_model.CpModel()
+    teachers = req.teachers
+    
+    # 変数定義 x[t_id, class, day, period]
     x = {}
     for t in teachers:
         for c in t.classes:
-            for d in range(len(DAYS)):
-                for p in range(len(PERIODS)):
-                    x[(t.id, c, d, p)] = model.NewBoolVar(f'x_{t.id}_{c}_{d}_{p}')
+            for d, day in enumerate(DAYS):
+                for p_idx, p in enumerate(PERIODS):
+                    x[(t.id, c, day, p)] = model.NewBoolVar(f"x_{t.id}_{c}_{day}_{p}")
 
-    # --- 2. 必須（ハード）制約 ---
-
-    # (A) 各教科・各クラスの指定コマ数を満たす
+    # (1) 各教員・クラスのコマ数割り当て
     for t in teachers:
         for c in t.classes:
             model.Add(
-                sum(x[(t.id, c, d, p)] for d in range(len(DAYS)) for p in range(len(PERIODS))) == t.hours
+                sum(x[(t.id, c, day, p)] for day in DAYS for p in PERIODS) == t.hours
             )
 
-    # (B) 教員の重複禁止（教員名 t.name で集約して同コマ重複を防ぐ）
-    teacher_name_map: Dict[str, List[tuple]] = {}
-    teacher_total_hours: Dict[str, int] = {}
-
+    # (2) 教員の同時間帯重複の禁止 (同一教員IDをすべて集約)
+    teacher_classes_map = {}
     for t in teachers:
-        if t.name not in teacher_name_map:
-            teacher_name_map[t.name] = []
-            teacher_total_hours[t.name] = 0
-        
-        teacher_total_hours[t.name] += t.hours * len(t.classes)
+        if t.id not in teacher_classes_map:
+            teacher_classes_map[t.id] = []
         for c in t.classes:
-            teacher_name_map[t.name].append((t.id, c))
+            teacher_classes_map[t.id].append(c)
 
-    for t_name, tc_list in teacher_name_map.items():
-        for d in range(len(DAYS)):
-            for p in range(len(PERIODS)):
-                # 同一教員は同じ曜日・時限に最大1コマ（例：佐藤先生の国語と道徳が重ならない）
+    for tid, cls_list in teacher_classes_map.items():
+        for day in DAYS:
+            for p in PERIODS:
                 model.Add(
-                    sum(x[(t_id, c, d, p)] for (t_id, c) in tc_list) <= 1
+                    sum(x[(tid, c, day, p)] for c in cls_list) <= 1
                 )
 
-    # (C) クラスの重複禁止（1つのクラスに同じコマで2つ以上の授業が入らない）
-    class_teachers_map: Dict[str, List[tuple]] = {}
+    # (3) クラスの同時間帯重複の禁止
+    class_teachers_map = {}
     for t in teachers:
         for c in t.classes:
             if c not in class_teachers_map:
                 class_teachers_map[c] = []
-            class_teachers_map[c].append((t.id, c))
+            class_teachers_map[c].append(t)
 
-    for c, tc_list in class_teachers_map.items():
-        for d in range(len(DAYS)):
-            for p in range(len(PERIODS)):
+    for c, t_list in class_teachers_map.items():
+        for day in DAYS:
+            for p in PERIODS:
                 model.Add(
-                    sum(x[(t_id, cls_name, d, p)] for (t_id, cls_name) in tc_list) <= 1
+                    sum(x[(t.id, c, day, p)] for t in t_list) <= 1
                 )
 
-    # (D) NG設定（不可曜日・時限の適用）
-    day_map = {d: i for i, d in enumerate(DAYS)}
-    for ng in ng_list:
-        if ng.day in day_map:
-            d_idx = day_map[ng.day]
-            p_str = str(ng.period).replace('限', '').replace('時限', '').strip()
-            if p_str.isdigit():
-                p_idx = int(p_str) - 1
-                if 0 <= p_idx < len(PERIODS):
-                    for t in teachers:
-                        if t.id == ng.teacher_id:
-                            for c in t.classes:
-                                model.Add(x[(t.id, c, d_idx, p_idx)] == 0)
+    # (4) 1日1教科1コマまで（同一クラス）
+    for c, t_list in class_teachers_map.items():
+        subj_teachers = {}
+        for t in t_list:
+            if t.subject not in subj_teachers:
+                subj_teachers[t.subject] = []
+            subj_teachers[t.subject].append(t.id)
 
-    # --- 3. 調整（ソフト）制約 ---
-
-    # (E) 1日あたりの同一教科上限（各クラスで同じ教科は1日 max_per_day コマまで）
-    max_per_day = opts.max_per_day or 1
-    for c, tc_list in class_teachers_map.items():
-        subj_map: Dict[str, List[tuple]] = {}
-        for t_id, cls_name in tc_list:
-            t_obj = next(t for t in teachers if t.id == t_id)
-            if t_obj.subject not in subj_map:
-                subj_map[t_obj.subject] = []
-            subj_map[t_obj.subject].append((t_id, cls_name))
-            
-        for subj, list_pairs in subj_map.items():
-            for d in range(len(DAYS)):
+        for subj, t_ids in subj_teachers.items():
+            for day in DAYS:
                 model.Add(
-                    sum(x[(t_id, cls_name, d, p)] for (t_id, cls_name) in list_pairs for p in range(len(PERIODS))) <= max_per_day
+                    sum(x[(tid, c, day, p)] for tid in t_ids for p in PERIODS) <= 1
                 )
 
-    # (F) 3コマ以上連続授業の禁止（生徒側の負担軽減）
-    max_consecutive = opts.max_consecutive or 2
-    for c, tc_list in class_teachers_map.items():
-        for d in range(len(DAYS)):
-            for p in range(len(PERIODS) - max_consecutive):
+    # (5) 教員の連続授業数制限（例：3コマ連続禁止）
+    max_c = req.max_consecutive
+    for tid, cls_list in teacher_classes_map.items():
+        for day in DAYS:
+            for p_idx in range(len(PERIODS) - max_c):
+                target_periods = PERIODS[p_idx : p_idx + max_c + 1]
                 model.Add(
-                    sum(x[(t_id, cls_name, d, p + k)] for (t_id, cls_name) in tc_list for k in range(max_consecutive + 1)) <= max_consecutive
+                    sum(x[(tid, c, day, p)] for c in cls_list for p in target_periods) <= max_c
                 )
 
-    # (G) 曜日ごとのコマ数平準化
-    if opts.balance_days:
-        for t_name, tc_list in teacher_name_map.items():
-            tot_h = teacher_total_hours[t_name]
-            max_daily_limit = (tot_h + len(DAYS) - 1) // len(DAYS) + 1
-            for d in range(len(DAYS)):
-                model.Add(
-                    sum(x[(t_id, c, d, p)] for (t_id, c) in tc_list for p in range(len(PERIODS))) <= max_daily_limit
-                )
+    # (6) NG枠制限
+    for ng in req.ng_list:
+        if ng.day in DAYS and ng.period in PERIODS:
+            if ng.target_type == 'teacher':
+                tid = int(ng.target_id)
+                if tid in teacher_classes_map:
+                    for c in teacher_classes_map[tid]:
+                        model.Add(x[(tid, c, ng.day, ng.period)] == 0)
+            elif ng.target_type == 'class':
+                c = ng.target_id
+                if c in class_teachers_map:
+                    for t in class_teachers_map[c]:
+                        model.Add(x[(t.id, c, ng.day, ng.period)] == 0)
 
-        daily_totals = []
-        for d in range(len(DAYS)):
-            day_total = model.NewIntVar(0, len(teachers) * len(PERIODS), f'day_total_{d}')
-            model.Add(day_total == sum(x[(t.id, c, d, p)] for t in teachers for c in t.classes for p in range(len(PERIODS))))
-            daily_totals.append(day_total)
-
-        max_day_load = model.NewIntVar(0, len(teachers) * len(PERIODS), 'max_day_load')
-        min_day_load = model.NewIntVar(0, len(teachers) * len(PERIODS), 'min_day_load')
-
-        for d in range(len(DAYS)):
-            model.Add(daily_totals[d] <= max_day_load)
-            model.Add(daily_totals[d] >= min_day_load)
-
-        model.Minimize(max_day_load - min_day_load)
-
-    # --- 4. 実行・解答取得 ---
+    # ソルバーの実行
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 20.0  # 探索タイムアウト 20秒
+    solver.parameters.max_time_in_seconds = req.time_limit
     status = solver.Solve(model)
 
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        timetable = []
+    if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        schedule = []
         for t in teachers:
             for c in t.classes:
-                for d_idx, day_name in enumerate(DAYS):
-                    for p_idx, p_num in enumerate(PERIODS):
-                        if solver.Value(x[(t.id, c, d_idx, p_idx)]) == 1:
-                            timetable.append({
-                                "teacher": t.name,
-                                "subject": t.subject,
+                for day in DAYS:
+                    for p in PERIODS:
+                        if solver.Value(x[(t.id, c, day, p)]) == 1:
+                            schedule.append({
                                 "class": c,
-                                "day": day_name,
-                                "period": p_num
+                                "day": day,
+                                "period": p,
+                                "subject": t.subject,
+                                "teacher_id": t.id,
+                                "teacher_name": t.name
                             })
-        return {
-            "status": "SUCCESS",
-            "timetable": timetable
-        }
-    elif status == cp_model.INFEASIBLE:
-        return {
-            "status": "INFEASIBLE",
-            "message": "条件を満たす時間割が存在しません。各クラスの合計コマ数が週30コマを超えていないか、NG設定を緩和して再試行してください。"
-        }
+        return {"status": "SUCCESS", "schedule": schedule}
     else:
-        return {
-            "status": "ERROR",
-            "message": "探索時間内に解が見つかりませんでした。"
-        }
+        raise HTTPException(status_code=400, detail="条件を満たす時間割を作成できませんでした。制約を緩和してください。")
