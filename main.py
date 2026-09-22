@@ -1,5 +1,11 @@
 """
-学校時間割最適化 API v2.2.16
+学校時間割最適化 API v2.3.0
+
+v2.3.0 の変更
+  ・fixed_lessons（固定コマ）に対応：手で決めた授業を動かさず、空いているコマだけを自動で埋める
+    （GAS の「空欄だけ自動で埋める」で使用。省略すれば従来どおり全体を生成）
+
+旧版（v2.2.16）の変更
 
 v2.2.15 からの主な変更
   1. 教員被りチェックを修正
@@ -22,7 +28,7 @@ from typing import List, Optional, Dict, Tuple
 import random
 import time
 
-VERSION = "2.2.16"
+VERSION = "2.3.0"
 app = FastAPI(title="学校時間割最適化 API", version=VERSION)
 
 DAYS = ["月", "火", "水", "木", "金"]
@@ -68,6 +74,13 @@ class SpecialTeacher(BaseModel):
     teacher_id: Optional[int] = None
 
 
+class FixedLesson(BaseModel):
+    class_name: str
+    day: str
+    period: int
+    subject: str
+
+
 class ScheduleRequest(BaseModel):
     teachers: List[TeacherAssignment]
     ng_list: Optional[List[NGItem]] = []
@@ -75,6 +88,7 @@ class ScheduleRequest(BaseModel):
     short_days: Optional[List[str]] = None
     special_teachers: Optional[List[SpecialTeacher]] = []
     subject_hours: Optional[Dict[str, Dict[str, int]]] = None
+    fixed_lessons: Optional[List[FixedLesson]] = []
     facility_limits: Optional[Dict[str, int]] = {}
     require_full: Optional[bool] = True
     max_consecutive: Optional[int] = 4
@@ -85,7 +99,7 @@ class ScheduleRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": f"学校時間割最適化API v{VERSION}（教員被り修正 + 押し出し修復版）"}
+    return {"message": f"学校時間割最適化API v{VERSION}（固定コマ対応 + 押し出し修復版）"}
 
 
 def grade_of(class_name: str) -> str:
@@ -166,6 +180,24 @@ class Problem:
                     self.units.append({"class": c, "subject": subj,
                                        "tkey": teacher["id"], "tname": teacher["name"]})
 
+        # ===== 固定コマ（手で決めた授業）=====
+        # 学年一斉コマと重なるもの・枠外のものは除外し、その分の授業ユニットを減らす
+        self.fixed = []
+        group_cells = {(c, d, p) for c in self.classes for (g, d, p) in self.group if grade_of(c) == g}
+        for fl in getattr(req, "fixed_lessons", None) or []:
+            c, d, p, subj = fl.class_name.strip(), fl.day.strip(), int(fl.period), fl.subject.strip()
+            if c not in self.classes or (d, p) not in self.slots or (c, d, p) in group_cells or not subj:
+                continue
+            if subj in SPECIAL_ACTIVITIES:
+                tkey, tname = self.special_teacher.get((subj, c), (None, ""))
+            else:
+                t = next((t for t in self.teachers if t["subject"] == subj and c in t["classes"]), None)
+                tkey, tname = (t["id"], t["name"]) if t else (None, "")
+            self.fixed.append({"class": c, "subject": subj, "tkey": tkey, "tname": tname, "slot": (d, p)})
+            idx = next((i for i, u in enumerate(self.units) if u["class"] == c and u["subject"] == subj), None)
+            if idx is not None:
+                self.units.pop(idx)
+
         # 先生ごとの担当コマ数（配置の優先度に使う）
         load = {}
         for u in self.units:
@@ -178,6 +210,7 @@ class Problem:
         self.notes: List[str] = []
         blocked = {(c, d, p) for c in self.classes for (g, d, p) in self.group
                    if grade_of(c) == g and (d, p) in self.slots}
+        blocked |= {(f["class"], f["slot"][0], f["slot"][1]) for f in self.fixed}
 
         for c in self.classes:
             n_units = sum(1 for u in self.units if u["class"] == c)
@@ -284,6 +317,15 @@ class State:
                 self._put({"class": c, "subject": subj, "tkey": tkey, "tname": tname},
                           c, (d, p), fixed=True)
 
+    # ---- 固定コマ（手で決めた授業。制約チェックなしでそのまま置く）----
+    def place_fixed(self):
+        for f in self.P.fixed:
+            c, slot = f["class"], f["slot"]
+            if self.cell[c][slot] is not None:
+                continue
+            u = {k: f[k] for k in ("class", "subject", "tkey", "tname")}
+            self._put(u, c, slot, fixed=True)
+
     # ---- 貪欲配置 ----
     def greedy(self, units):
         for u in units:
@@ -364,6 +406,7 @@ class State:
 def build_one(prob: Problem, deadline: float) -> State:
     st = State(prob)
     st.place_group_slots()
+    st.place_fixed()
     units = list(prob.units)
     random.shuffle(units)
     # 施設上限のある教科 → 担当コマの多い先生 の順に先に置く（揺らぎ付き）
