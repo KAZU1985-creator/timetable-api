@@ -218,51 +218,58 @@ def optimize_schedule(request: ScheduleRequest):
                 placed_count = 0
                 
                 for _ in range(needed):
-                    placed = False
-                    
-                    slot_list = []
+                    # ========== 先に1日1コマ制限に違反しないスロットを全て絞る ==========
+                    valid_slots = []
                     for day in days:
                         for period in periods:
-                            if class_timetable[class_name][day][period] is None:
-                                slot_list.append((day, period))
-                    
-                    random.shuffle(slot_list)
-                    
-                    for day, period in slot_list:
-                        if day in short_days and period == 6:
-                            continue
-                        
-                        # ========== 制約1: 同じ日に同じ技能教科が複数配置されないようにチェック ==========
-                        same_subject_count_today = sum(1 for p in periods 
-                                                      if class_timetable[class_name][day].get(p) and 
-                                                      subject in str(class_timetable[class_name][day].get(p)))
-                        if same_subject_count_today > 0:
-                            continue  # この日はこの教科が既にあるのでスキップ
-                        
-                        # ========== 制約2: 連続チェック ==========
-                        prev_subject = None
-                        next_subject = None
-                        if period > 1:
-                            prev_val = class_timetable[class_name][day].get(period - 1)
-                            if prev_val and prev_val != "BLOCKED":
-                                prev_subject = prev_val.split('|')[0]
-                        if period < 6:
-                            next_val = class_timetable[class_name][day].get(period + 1)
-                            if next_val and next_val != "BLOCKED":
-                                next_subject = next_val.split('|')[0]
-                        
-                        if prev_subject == subject or next_subject == subject:
-                            continue
-                        
-                        # 施設上限をチェック
-                        if subject in facility_limits:
-                            current_facility_usage = sum(1 for c in all_classes 
-                                                        for p in periods 
-                                                        if class_timetable[c][day].get(p) and 
-                                                        subject in str(class_timetable[c][day].get(p)))
-                            if current_facility_usage >= facility_limits[subject]:
+                            if class_timetable[class_name][day][period] is not None:
+                                continue  # 既に埋まっている
+                            
+                            if day in short_days and period == 6:
+                                continue  # 水曜の6限
+                            
+                            # この日にこの教科がまだ配置されていないかチェック
+                            same_subject_count_today = sum(1 for p in periods 
+                                                          if class_timetable[class_name][day].get(p) and 
+                                                          subject in str(class_timetable[class_name][day].get(p)))
+                            if same_subject_count_today > 0:
+                                continue  # この日はこの教科が既にあるのでスキップ
+                            
+                            # 連続チェック
+                            prev_subject = None
+                            next_subject = None
+                            if period > 1:
+                                prev_val = class_timetable[class_name][day].get(period - 1)
+                                if prev_val and prev_val != "BLOCKED":
+                                    prev_subject = prev_val.split('|')[0]
+                            if period < 6:
+                                next_val = class_timetable[class_name][day].get(period + 1)
+                                if next_val and next_val != "BLOCKED":
+                                    next_subject = next_val.split('|')[0]
+                            
+                            if prev_subject == subject or next_subject == subject:
                                 continue
-                        
+                            
+                            # 施設上限をチェック
+                            if subject in facility_limits:
+                                current_facility_usage = sum(1 for c in all_classes 
+                                                            for p in periods 
+                                                            if class_timetable[c][day].get(p) and 
+                                                            subject in str(class_timetable[c][day].get(p)))
+                                if current_facility_usage >= facility_limits[subject]:
+                                    continue
+                            
+                            valid_slots.append((day, period))
+                    
+                    if not valid_slots:
+                        print(f"DEBUG: {class_name} {subject}: 有効なスロットなし")
+                        break
+                    
+                    # ランダムにスロットを選ぶ
+                    random.shuffle(valid_slots)
+                    
+                    placed = False
+                    for day, period in valid_slots:
                         # 利用可能な教員を探す
                         available_teacher = None
                         if subject in subject_teachers:
@@ -285,6 +292,10 @@ def optimize_schedule(request: ScheduleRequest):
                             placed = True
                             placed_count += 1
                             break
+                    
+                    if not placed:
+                        print(f"DEBUG: {class_name} {subject}: 利用可能な教員がない")
+                        break
                 
                 print(f"DEBUG: {class_name} {subject}={placed_count}/{needed}")
         
@@ -312,42 +323,49 @@ def optimize_schedule(request: ScheduleRequest):
                 placed_count = 0
                 
                 for _ in range(needed):
-                    placed = False
-                    
-                    slot_list = []
+                    # ========== 先に1日1コマ制限に違反しないスロットを全て絞る ==========
+                    valid_slots = []
                     for day in days:
                         for period in periods:
-                            if class_timetable[class_name][day][period] is None:
-                                slot_list.append((day, period))
+                            if class_timetable[class_name][day][period] is not None:
+                                continue  # 既に埋まっている
+                            
+                            if day in short_days and period == 6:
+                                continue  # 水曜の6限
+                            
+                            # この日にこの教科がまだ配置されていないかチェック
+                            same_subject_count_today = sum(1 for p in periods 
+                                                          if class_timetable[class_name][day].get(p) and 
+                                                          subject in str(class_timetable[class_name][day].get(p)))
+                            if same_subject_count_today > 0:
+                                continue  # この日はこの教科が既にあるのでスキップ
+                            
+                            # 連続チェック
+                            prev_subject = None
+                            next_subject = None
+                            if period > 1:
+                                prev_val = class_timetable[class_name][day].get(period - 1)
+                                if prev_val and prev_val != "BLOCKED":
+                                    prev_subject = prev_val.split('|')[0]
+                            if period < 6:
+                                next_val = class_timetable[class_name][day].get(period + 1)
+                                if next_val and next_val != "BLOCKED":
+                                    next_subject = next_val.split('|')[0]
+                            
+                            if prev_subject == subject or next_subject == subject:
+                                continue
+                            
+                            valid_slots.append((day, period))
                     
-                    random.shuffle(slot_list)
+                    if not valid_slots:
+                        print(f"DEBUG: {class_name} {subject}: 有効なスロットなし")
+                        break
                     
-                    for day, period in slot_list:
-                        if day in short_days and period == 6:
-                            continue
-                        
-                        # ========== 制約1: 同じ日に同じ5教科が複数配置されないようにチェック ==========
-                        same_subject_count_today = sum(1 for p in periods 
-                                                      if class_timetable[class_name][day].get(p) and 
-                                                      subject in str(class_timetable[class_name][day].get(p)))
-                        if same_subject_count_today > 0:
-                            continue  # この日はこの教科が既にあるのでスキップ
-                        
-                        # ========== 制約2: 連続チェック ==========
-                        prev_subject = None
-                        next_subject = None
-                        if period > 1:
-                            prev_val = class_timetable[class_name][day].get(period - 1)
-                            if prev_val and prev_val != "BLOCKED":
-                                prev_subject = prev_val.split('|')[0]
-                        if period < 6:
-                            next_val = class_timetable[class_name][day].get(period + 1)
-                            if next_val and next_val != "BLOCKED":
-                                next_subject = next_val.split('|')[0]
-                        
-                        if prev_subject == subject or next_subject == subject:
-                            continue
-                        
+                    # ランダムにスロットを選ぶ
+                    random.shuffle(valid_slots)
+                    
+                    placed = False
+                    for day, period in valid_slots:
                         # 利用可能な教員を探す
                         available_teacher = None
                         if subject in subject_teachers:
@@ -370,6 +388,10 @@ def optimize_schedule(request: ScheduleRequest):
                             placed = True
                             placed_count += 1
                             break
+                    
+                    if not placed:
+                        print(f"DEBUG: {class_name} {subject}: 利用可能な教員がない")
+                        break
                 
                 print(f"DEBUG: {class_name} {subject}={placed_count}/{needed}")
         
