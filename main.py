@@ -1,5 +1,10 @@
 """
-学校時間割最適化 API v2.3.0
+学校時間割最適化 API v2.3.1
+
+v2.3.1 の変更
+  ・先生を「教員ID」ではなく「教員名」で識別（2教科を持つ先生＝教員設定で2行でも同一人物として扱う）
+    旧: 行ごとに別人扱い → 同じ時間に2か所へ配置、NGも片方の行にしか効かない不具合があった
+
 
 v2.3.0 の変更
   ・fixed_lessons（固定コマ）に対応：手で決めた授業を動かさず、空いているコマだけを自動で埋める
@@ -28,7 +33,7 @@ from typing import List, Optional, Dict, Tuple
 import random
 import time
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 app = FastAPI(title="学校時間割最適化 API", version=VERSION)
 
 DAYS = ["月", "火", "水", "木", "金"]
@@ -102,6 +107,11 @@ def read_root():
     return {"message": f"学校時間割最適化API v{VERSION}（固定コマ対応 + 押し出し修復版）"}
 
 
+def teacher_key(name: str) -> str:
+    """先生の識別キー（半角・全角スペースを除いた名前）"""
+    return "".join(str(name or "").split())
+
+
 def grade_of(class_name: str) -> str:
     """'1-2' → '1年'"""
     return f"{str(class_name).strip()[0]}年"
@@ -127,6 +137,8 @@ class Problem:
                                   "subject": t.subject.strip(), "classes": classes,
                                   "hours": int(t.hours)})
         self.name_to_id = {t["name"]: t["id"] for t in self.teachers}
+        # 先生の識別キー＝空白を除いた教員名（同じ先生が複数行＝複数教科でも同一人物）
+        self.id_to_key = {t["id"]: teacher_key(t["name"]) for t in self.teachers}
 
         self.classes = sorted({c for t in self.teachers for c in t["classes"]})
 
@@ -139,7 +151,9 @@ class Problem:
         for ng in req.ng_list or []:
             if ng.target_type == "teacher":
                 try:
-                    self.ng.add((int(ng.target_id), ng.day, int(ng.period)))
+                    key = self.id_to_key.get(int(ng.target_id))
+                    if key:
+                        self.ng.add((key, ng.day, int(ng.period)))
                 except ValueError:
                     pass
 
@@ -152,8 +166,7 @@ class Problem:
         # 特別活動の担当（教科, クラス）→ (先生キー, 先生名)
         self.special_teacher = {}
         for st in req.special_teachers or []:
-            tid = st.teacher_id if st.teacher_id else self.name_to_id.get(st.teacher_name.strip())
-            key = tid if tid else f"name:{st.teacher_name.strip()}"
+            key = teacher_key(st.teacher_name)
             self.special_teacher[(st.subject.strip(), st.class_name.strip())] = (key, st.teacher_name.strip())
 
         # 配置すべき授業（1コマ = 1ユニット）
@@ -178,7 +191,7 @@ class Problem:
                     continue
                 for _ in range(hours):
                     self.units.append({"class": c, "subject": subj,
-                                       "tkey": teacher["id"], "tname": teacher["name"]})
+                                       "tkey": teacher_key(teacher["name"]), "tname": teacher["name"]})
 
         # ===== 固定コマ（手で決めた授業）=====
         # 学年一斉コマと重なるもの・枠外のものは除外し、その分の授業ユニットを減らす
@@ -192,7 +205,7 @@ class Problem:
                 tkey, tname = self.special_teacher.get((subj, c), (None, ""))
             else:
                 t = next((t for t in self.teachers if t["subject"] == subj and c in t["classes"]), None)
-                tkey, tname = (t["id"], t["name"]) if t else (None, "")
+                tkey, tname = (teacher_key(t["name"]), t["name"]) if t else (None, "")
             self.fixed.append({"class": c, "subject": subj, "tkey": tkey, "tname": tname, "slot": (d, p)})
             idx = next((i for i, u in enumerate(self.units) if u["class"] == c and u["subject"] == subj), None)
             if idx is not None:
