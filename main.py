@@ -152,30 +152,45 @@ def try_place_subject(class_timetable, class_name, subject,
     random.shuffle(all_valid_slots)
     
     for day, period in all_valid_slots:
-            # 利用可能な教員を探す
-            available_teacher = None
-            if subject in subject_teachers:
-                for teacher_entry in subject_teachers[subject]:
-                    if teacher_entry['class'] != class_name:
-                        continue
-                    
-                    if (teacher_entry['id'], day, period) in ng_set:
-                        continue
-                    
-                    if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
-                        continue
-                    
-                    if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
-                        continue
-                    
-                    available_teacher = teacher_entry
-                    break
-            
-            if available_teacher:
-                class_timetable[class_name][day][period] = f"{subject}|{available_teacher['name']}"
-                teacher_hours_used[available_teacher['id']] += 1
-                teacher_class_hours_used[(available_teacher['id'], class_name)] += 1
-                return True
+        # ★配置前に連続配置をチェック
+        prev_subject = None
+        next_subject = None
+        if period > 1:
+            prev_val = class_timetable[class_name][day].get(period - 1)
+            if prev_val and prev_val != "BLOCKED":
+                prev_subject = prev_val.split('|')[0]
+        if period < 6:
+            next_val = class_timetable[class_name][day].get(period + 1)
+            if next_val and next_val != "BLOCKED":
+                next_subject = next_val.split('|')[0]
+        
+        if prev_subject == subject or next_subject == subject:
+            continue  # この(day, period)はスキップ
+        
+        # 利用可能な教員を探す
+        available_teacher = None
+        if subject in subject_teachers:
+            for teacher_entry in subject_teachers[subject]:
+                if teacher_entry['class'] != class_name:
+                    continue
+                
+                if (teacher_entry['id'], day, period) in ng_set:
+                    continue
+                
+                if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
+                    continue
+                
+                if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
+                    continue
+                
+                available_teacher = teacher_entry
+                break
+        
+        if available_teacher:
+            class_timetable[class_name][day][period] = f"{subject}|{available_teacher['name']}"
+            teacher_hours_used[available_teacher['id']] += 1
+            teacher_class_hours_used[(available_teacher['id'], class_name)] += 1
+            return True
     
     return False
 
