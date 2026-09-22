@@ -448,12 +448,124 @@ def calculate_fill_rate(schedule, all_classes, days, short_days):
         return 0.0
     return filled / total_possible
 
+def fill_gaps_safely(schedule, all_classes, days, short_days):
+    """
+    安全な空白埋め（必須コマ数を超えない）
+    - 不足している教科のみを埋める
+    - コマ数上限を絶対に超えない
+    - 連続配置や同一曜日の制約も守る
+    """
+    # 各クラスの時間割を辞書化
+    class_timetable = {}
+    for class_name in all_classes:
+        class_timetable[class_name] = {}
+        for day in days:
+            class_timetable[class_name][day] = {}
+            for period in range(1, 7):
+                class_timetable[class_name][day][period] = None
+    
+    # スケジュールをグリッドに戻す
+    for item in schedule:
+        class_timetable[item['class']][item['day']][item['period']] = item
+    
+    # 各クラスごとに不足を埋める
+    new_schedule = list(schedule)
+    
+    for class_name in all_classes:
+        grade = class_name[0]
+        grade_key = f"{grade}年"
+        required_subjects = SUBJECT_MASTER.get(grade_key, {})
+        
+        # 現在のコマ数を集計
+        current_counts = {}
+        for item in schedule:
+            if item['class'] == class_name:
+                current_counts[item['subject']] = current_counts.get(item['subject'], 0) + 1
+        
+        # 不足している教科を探す
+        deficit_subjects = []
+        for subject, required in required_subjects.items():
+            current = current_counts.get(subject, 0)
+            deficit = required - current
+            
+            # ★重要：不足分のみ（負数=超過はスキップ）
+            if deficit > 0:
+                for _ in range(deficit):
+                    deficit_subjects.append(subject)
+        
+        if not deficit_subjects:
+            continue  # このクラスに不足なし
+        
+        # 空きスロットを収集
+        empty_slots = []
+        for day in days:
+            for period in range(1, 7):
+                if day in short_days and period == 6:
+                    continue
+                if class_timetable[class_name][day][period] is None:
+                    empty_slots.append((day, period))
+        
+        if not empty_slots:
+            continue  # 空きスロットなし
+        
+        # ランダムに埋める（必要な分だけ）
+        random.shuffle(empty_slots)
+        random.shuffle(deficit_subjects)
+        
+        slot_idx = 0
+        for subject in deficit_subjects:
+            if slot_idx >= len(empty_slots):
+                break  # スロット不足
+            
+            day, period = empty_slots[slot_idx]
+            
+            # ★安全チェック1：同一曜日に同じ教科がないか
+            same_subject_count = sum(1 for p in range(1, 7)
+                                    if class_timetable[class_name][day][p] 
+                                    and class_timetable[class_name][day][p]['subject'] == subject)
+            if same_subject_count > 0:
+                continue  # 同一曜日に同じ教科 → この slot を飛ばす
+            
+            # ★安全チェック2：連続配置がないか
+            prev_period = period - 1
+            next_period = period + 1
+            prev_subject = None
+            next_subject = None
+            
+            if prev_period >= 1:
+                prev_item = class_timetable[class_name][day][prev_period]
+                if prev_item:
+                    prev_subject = prev_item['subject']
+            
+            if next_period <= 6:
+                next_item = class_timetable[class_name][day][next_period]
+                if next_item:
+                    next_subject = next_item['subject']
+            
+            if prev_subject == subject or next_subject == subject:
+                continue  # 連続配置 → この slot を飛ばす
+            
+            # ★埋める
+            new_schedule.append({
+                "class": class_name,
+                "day": day,
+                "period": period,
+                "subject": subject,
+                "teacher_name": "（補填）"
+            })
+            class_timetable[class_name][day][period] = {
+                "subject": subject
+            }
+            slot_idx += 1
+    
+    return new_schedule
+
 @app.post("/optimize")
 def optimize_schedule(request: ScheduleRequest):
     """
     時間割最適化エンドポイント（v2.2.15・複数試行版）
     
-    20回試行して、違反0を最優先で選ぶ
+    5回試行して、最も充填率が高い結果を返す
     """
     
     try:
@@ -580,11 +692,18 @@ def optimize_schedule(request: ScheduleRequest):
         
         print(f"DEBUG: 最良試行の充填率={best_fill_rate:.1%} 違反数={best_violations} ({len(best_schedule)}コマ)")
         
+        # ========== 空白埋め処理（安全版・必須コマ数を超えない） ==========
+        print("DEBUG: ========== 空白埋めを開始 ==========")
+        best_schedule = fill_gaps_safely(best_schedule, all_classes, days, short_days)
+        
+        final_fill_rate = calculate_fill_rate(best_schedule, all_classes, days, short_days)
+        print(f"DEBUG: 空白埋め後の充填率={final_fill_rate:.1%} ({len(best_schedule)}コマ)")
+        
         return {
             "schedule": best_schedule,
             "status": "SUCCESS",
-            "message": f"時間割生成完了: {len(best_schedule)}コマ配置（充填率: {best_fill_rate:.1%}）",
-            "fill_rate": best_fill_rate
+            "message": f"時間割生成完了: {len(best_schedule)}コマ配置（充填率: {final_fill_rate:.1%}）",
+            "fill_rate": final_fill_rate
         }
     
     except Exception as e:
