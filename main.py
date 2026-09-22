@@ -91,7 +91,7 @@ def try_place_subject(class_timetable, class_name, subject,
             if same_subject_count_today > 0:
                 continue
             
-            # 連続配置チェック
+            # 連続配置チェック（より厳密に）
             prev_subject = None
             next_subject = None
             if period > 1:
@@ -103,6 +103,7 @@ def try_place_subject(class_timetable, class_name, subject,
                 if next_val and next_val != "BLOCKED":
                     next_subject = next_val.split('|')[0]
             
+            # ★同じ教科が連続で配置されていないかチェック
             if prev_subject == subject or next_subject == subject:
                 continue
             
@@ -426,6 +427,16 @@ def optimize_schedule(request: ScheduleRequest):
         
         # 施設上限を設定
         facility_limits = request.facility_limits or {}
+        
+        # ★基礎5教科にもデフォルト施設上限を設定（GASから受け取らない場合の保険）
+        core_subjects_with_defaults = ['国語', '社会', '数学', '英語']
+        for subj in core_subjects_with_defaults:
+            if subj not in facility_limits:
+                facility_limits[subj] = 1  # 同じ限に1クラスまで
+        
+        # ★デバッグ用ログ
+        print(f"DEBUG: Received facility_limits = {request.facility_limits}")
+        print(f"DEBUG: Final facility_limits = {facility_limits}")
         
         # 学年一斉コマをセット化
         group_slots_by_time = {}
