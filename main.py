@@ -73,10 +73,7 @@ def try_place_subject(class_timetable, class_name, subject,
     if all_classes is None:
         all_classes = list(class_timetable.keys())
     
-    # ★金→木→水→火→月の優先度でソート
-    day_priority = {"金": 5, "木": 4, "水": 3, "火": 2, "月": 1}
-    
-    # 有効なスロットを収集（曜日順）
+    # 有効なスロットを収集（曜日別）
     valid_slots_by_day = {day: [] for day in days}
     
     for day in days:
@@ -142,18 +139,20 @@ def try_place_subject(class_timetable, class_name, subject,
             
             valid_slots_by_day[day].append(period)
     
-    # ★優先度の高い曜日から試す（金→木→水→火→月）
-    sorted_days = sorted(days, key=lambda d: -day_priority.get(d, 0))
+    # ★曜日バランス重視：全曜日を同等に扱う（ランダム化）
+    # （金→木優先を廃止し、月火水木金に均等に分散させる）
+    all_valid_slots = []
+    for day in days:
+        for period in valid_slots_by_day[day]:
+            all_valid_slots.append((day, period))
     
-    for day in sorted_days:
-        if not valid_slots_by_day[day]:
-            continue
-        
-        # この曜日のスロットをランダムに並べて試す
-        periods_to_try = valid_slots_by_day[day][:]
-        random.shuffle(periods_to_try)
-        
-        for period in periods_to_try:
+    if not all_valid_slots:
+        return False
+    
+    # ★ランダムに選ぶ（曜日優先度なし）
+    random.shuffle(all_valid_slots)
+    
+    for day, period in all_valid_slots:
             # 利用可能な教員を探す
             available_teacher = None
             if subject in subject_teachers:
