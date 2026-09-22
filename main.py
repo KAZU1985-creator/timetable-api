@@ -372,25 +372,27 @@ def optimize_schedule_single(normalized_teachers, ng_set, facility_limits, group
 
 def count_violations(schedule, facility_limits, all_classes):
     """
-    制約違反の数をカウント
-    - 同じ限に同じ教科が複数クラス配置されている（facility_limits違反）
-    - 同じクラスで同じ教科が連続している（連続配置違反）
+    制約違反の数をカウント（より厳密に）
+    - 同じ限に同じ教科が複数クラス配置されている（横かぶり）
+    - 同じクラスで同じ教科が連続している（縦かぶり）
+    - 同じ教員が同じ限に複数クラスを教えている
     """
     days = ["月", "火", "水", "木", "金"]
     periods = [1, 2, 3, 4, 5, 6]
     
     violation_count = 0
     
-    # 制約1：施設上限違反をカウント
+    # 違反1：施設上限違反をカウント（横かぶり）
     for day in days:
         for period in periods:
             for subject, limit in facility_limits.items():
                 count = sum(1 for item in schedule 
                            if item['day'] == day and item['period'] == period and item['subject'] == subject)
                 if count > limit:
+                    # ★超過分を全てカウント
                     violation_count += (count - limit)
     
-    # 制約2：連続配置違反をカウント
+    # 違反2：連続配置違反をカウント（縦かぶり）
     for class_name in all_classes:
         for day in days:
             for period in range(1, 6):  # 1-5限（6限の次はない）
@@ -399,6 +401,34 @@ def count_violations(schedule, facility_limits, all_classes):
                 
                 if item1 and item2 and item1['subject'] == item2['subject']:
                     violation_count += 1
+    
+    # 違反3：同じ教員が複数クラスで同じ限に配置
+    for day in days:
+        for period in periods:
+            teacher_subjects = {}  # 教員 -> (教科, クラス) のマッピング
+            
+            for item in schedule:
+                if item['day'] != day or item['period'] != period:
+                    continue
+                
+                # teacher_name から教員を特定（簡易版）
+                teacher_name = item.get('teacher_name', '')
+                subject = item['subject']
+                class_name = item['class']
+                
+                if teacher_name not in teacher_subjects:
+                    teacher_subjects[teacher_name] = []
+                
+                teacher_subjects[teacher_name].append((subject, class_name))
+            
+            # 同じ教員が同じ限に複数クラスを教えていないか確認
+            for teacher_name, subject_classes in teacher_subjects.items():
+                for subject, class_name in subject_classes:
+                    # この教員が同じ限に同じ教科を別のクラスで教えているか
+                    for other_subject, other_class in subject_classes:
+                        if class_name != other_class and subject == other_subject:
+                            violation_count += 1
+                            break  # 1クラスの重複は1回だけカウント
     
     return violation_count
 
@@ -506,8 +536,9 @@ def optimize_schedule(request: ScheduleRequest):
         best_fill_rate = 0.0
         best_violations = float('inf')  # ★違反数の初期値は無限大
         
-        for trial in range(5):
-            print(f"DEBUG: 試行 {trial + 1}/5")
+        # ★試行回数を20回に増やす（違反0を見つける確率を上げる）
+        for trial in range(20):
+            print(f"DEBUG: 試行 {trial + 1}/20")
             
             schedule = optimize_schedule_single(
                 normalized_teachers,
@@ -525,15 +556,17 @@ def optimize_schedule(request: ScheduleRequest):
             print(f"DEBUG: 試行 {trial + 1} 充填率={fill_rate:.1%} 違反数={violation_count}")
             
             # ★規則第一：違反0を最優先
-            # 1. 違反0の試行を探す → 見つかったら、その中で充填率が高い方を選ぶ
-            # 2. 違反0がなければ、違反が少ない方を選ぶ
-            
             if violation_count == 0:
                 # 違反0の試行が見つかった
                 if best_violations == float('inf') or fill_rate > best_fill_rate:
                     best_fill_rate = fill_rate
                     best_violations = 0
                     best_schedule = schedule
+                
+                # ★違反0を見つけたら、さらに2回試行して改善できるか確認
+                # （充填率をもう少し上げられるか試す）
+                if trial >= 2:  # 最低3回は試行する
+                    print(f"DEBUG: 違反0を発見。充填率={fill_rate:.1%}。さらに改善を試みます...")
             else:
                 # 違反0がまだ見つかっていない場合のみ、違反が少ない方を更新
                 if best_violations == float('inf') or violation_count < best_violations:
