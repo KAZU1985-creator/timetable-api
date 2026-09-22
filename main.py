@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ortools.sat.python import cp_model
 
-app = FastAPI(title="学校時間割最適化 API", version="2.1.0")
+app = FastAPI(title="学校時間割最適化 API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,6 +49,7 @@ class ScheduleRequest(BaseModel):
     max_consecutive: Optional[int] = 4
     max_teacher_daily_hours: Optional[int] = 5
     facility_limits: Optional[Dict[str, int]] = {}
+    total_hours: Optional[int] = 29                # 【重要】週あたりのコマ数（GASから送信・デフォルト29コマ）
     time_limit: Optional[float] = 60.0
 
 DAYS = ['月', '火', '水', '木', '金']
@@ -135,7 +136,7 @@ def diagnose(req, tasks, all_classes, short_set, class_blocked, teacher_ng):
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "message": "時間割最適化APIサーバーは正常に稼働しています。", "version": "2.1.0"}
+    return {"status": "online", "message": "時間割最適化APIサーバーは正常に稼働しています。", "version": "2.2.0"}
 
 
 @app.post("/optimize")
