@@ -34,8 +34,12 @@ class TeacherAssignment(BaseModel):
     id: int
     name: str
     subject: str
-    classes: List[str]
+    classes: List[str]  # リスト形式
     hours: int
+    
+    class Config:
+        # 文字列をリストに変換
+        use_enum_values = True
 
 class NGItem(BaseModel):
     target_type: str
@@ -89,14 +93,61 @@ def optimize_schedule(request: ScheduleRequest):
     """
     
     try:
+        # ========== データの正規化 ==========
+        # 教員データを再度バリデーション・正規化
+        normalized_teachers = []
+        for teacher in request.teachers:
+            try:
+                # IDが有効な整数か確認
+                teacher_id = int(teacher.id) if isinstance(teacher.id, (int, float, str)) else None
+                if not teacher_id or teacher_id <= 0:
+                    print(f"DEBUG: 無効な教員ID: {teacher.id}, スキップ")
+                    continue
+                
+                # クラスが空でないか確認
+                classes = teacher.classes if isinstance(teacher.classes, list) else []
+                if isinstance(teacher.classes, str):
+                    classes = [c.strip() for c in teacher.classes.split(',') if c.strip()]
+                
+                if not classes:
+                    print(f"DEBUG: 教員{teacher.name}の担当クラスが空, スキップ")
+                    continue
+                
+                # 週コマ数が有効か確認
+                hours = int(teacher.hours) if isinstance(teacher.hours, (int, float, str)) else 0
+                if hours <= 0:
+                    print(f"DEBUG: 教員{teacher.name}の週コマ数が0以下: {hours}, スキップ")
+                    continue
+                
+                normalized_teachers.append({
+                    'id': teacher_id,
+                    'name': teacher.name,
+                    'subject': teacher.subject,
+                    'classes': classes,
+                    'hours': hours
+                })
+            except Exception as e:
+                print(f"DEBUG: 教員データの正規化エラー: {e}, スキップ")
+                continue
+        
+        if not normalized_teachers:
+            return {
+                "schedule": [],
+                "status": "ERROR",
+                "message": "有効な教員データがありません"
+            }
+        
+        print(f"DEBUG: 正規化後の教員数: {len(normalized_teachers)}")
+        for t in normalized_teachers:
+            print(f"DEBUG: 教員 {t['name']} → 科目: {t['subject']}, クラス: {t['classes']}, 週コマ: {t['hours']}")
         days = ["月", "火", "水", "木", "金"]
         periods = [1, 2, 3, 4, 5, 6]
         short_days = request.short_days or ["水"]
         
-        # 全クラスを取得
+        # 全クラスを取得（正規化済みデータから）
         all_classes = set()
-        for teacher in request.teachers:
-            all_classes.update(teacher.classes)
+        for teacher in normalized_teachers:
+            all_classes.update(teacher['classes'])
         all_classes = sorted(list(all_classes))
         
         print(f"DEBUG: classes={all_classes}")
@@ -104,22 +155,22 @@ def optimize_schedule(request: ScheduleRequest):
         
         # 教科別に教員を分類（各クラスごと）
         subject_teachers = {}
-        for teacher in request.teachers:
-            if teacher.subject not in subject_teachers:
-                subject_teachers[teacher.subject] = []
+        for teacher in normalized_teachers:
+            if teacher['subject'] not in subject_teachers:
+                subject_teachers[teacher['subject']] = []
             
             # 教員が複数クラスを担当する場合、各クラスごとに分割
             # ★重要★ 各クラスでの上限 = 総週コマ数 ÷ 担当クラス数
-            hours_per_class = teacher.hours // len(teacher.classes) if teacher.classes else teacher.hours
+            hours_per_class = teacher['hours'] // len(teacher['classes']) if teacher['classes'] else teacher['hours']
             
-            for class_name in teacher.classes:
-                subject_teachers[teacher.subject].append({
-                    'id': teacher.id,
-                    'name': teacher.name,
-                    'subject': teacher.subject,
+            for class_name in teacher['classes']:
+                subject_teachers[teacher['subject']].append({
+                    'id': teacher['id'],
+                    'name': teacher['name'],
+                    'subject': teacher['subject'],
                     'class': class_name,
-                    'original_classes': teacher.classes,
-                    'total_hours': teacher.hours,  # 総時間数（表示・追跡用）
+                    'original_classes': teacher['classes'],
+                    'total_hours': teacher['hours'],  # 総時間数（表示・追跡用）
                     'max_hours_this_class': hours_per_class  # このクラスでの上限 ★重要★
                 })
         
@@ -140,10 +191,10 @@ def optimize_schedule(request: ScheduleRequest):
         # 教員の使用時間数を追跡
         teacher_hours_used = {}  # teacher_id → 総時間数
         teacher_class_hours_used = {}  # (teacher_id, class_name) → このクラスでの時間数
-        for teacher in request.teachers:
-            teacher_hours_used[teacher.id] = 0
-            for class_name in teacher.classes:
-                teacher_class_hours_used[(teacher.id, class_name)] = 0
+        for teacher in normalized_teachers:
+            teacher_hours_used[teacher['id']] = 0
+            for class_name in teacher['classes']:
+                teacher_class_hours_used[(teacher['id'], class_name)] = 0
         
         # NG時間帯をセット化
         ng_set = set()
@@ -439,6 +490,14 @@ def optimize_schedule(request: ScheduleRequest):
             print(f"DEBUG: {class_name}={subject_counts}")
         
         print(f"DEBUG: total_schedule={len(schedule)}")
+        
+        # 教員ごとの配置コマ数をサマリー
+        teacher_summary = {}
+        for item in schedule:
+            teacher_name = item.get('teacher_name', 'unknown')
+            teacher_summary[teacher_name] = teacher_summary.get(teacher_name, 0) + 1
+        
+        print(f"DEBUG: 教員別配置コマ数: {teacher_summary}")
         
         return {
             "schedule": schedule,
