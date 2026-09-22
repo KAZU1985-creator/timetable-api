@@ -167,6 +167,14 @@ def try_place_subject(class_timetable, class_name, subject,
         if prev_subject == subject or next_subject == subject:
             continue  # この(day, period)はスキップ
         
+        # ★配置前に施設上限を再度チェック（念のため）
+        if subject in facility_limits:
+            current_facility_usage = sum(1 for c in all_classes 
+                                        if class_timetable[c][day].get(period) and 
+                                        subject in str(class_timetable[c][day].get(period)))
+            if current_facility_usage >= facility_limits[subject]:
+                continue  # 施設上限に達していればスキップ
+        
         # 利用可能な教員を探す
         available_teacher = None
         if subject in subject_teachers:
@@ -516,14 +524,26 @@ def optimize_schedule(request: ScheduleRequest):
             
             print(f"DEBUG: 試行 {trial + 1} 充填率={fill_rate:.1%} 違反数={violation_count}")
             
-            # ★違反が少ない方 > 充填率が高い方 の優先順で選ぶ
-            is_better = (violation_count < best_violations) or \
-                       (violation_count == best_violations and fill_rate > best_fill_rate)
+            # ★規則第一：違反0を最優先
+            # 1. 違反0の試行を探す → 見つかったら、その中で充填率が高い方を選ぶ
+            # 2. 違反0がなければ、違反が少ない方を選ぶ
             
-            if is_better:
-                best_fill_rate = fill_rate
-                best_violations = violation_count
-                best_schedule = schedule
+            if violation_count == 0:
+                # 違反0の試行が見つかった
+                if best_violations == float('inf') or fill_rate > best_fill_rate:
+                    best_fill_rate = fill_rate
+                    best_violations = 0
+                    best_schedule = schedule
+            else:
+                # 違反0がまだ見つかっていない場合のみ、違反が少ない方を更新
+                if best_violations == float('inf') or violation_count < best_violations:
+                    best_fill_rate = fill_rate
+                    best_violations = violation_count
+                    best_schedule = schedule
+                elif violation_count == best_violations and fill_rate > best_fill_rate:
+                    # 違反数が同じなら充填率で比較
+                    best_fill_rate = fill_rate
+                    best_schedule = schedule
         
         print(f"DEBUG: 最良試行の充填率={best_fill_rate:.1%} 違反数={best_violations} ({len(best_schedule)}コマ)")
         
