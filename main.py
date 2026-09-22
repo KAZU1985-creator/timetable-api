@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 import random
 
-app = FastAPI(title="学校時間割最適化 API", version="2.2.12")
+app = FastAPI(title="学校時間割最適化 API", version="2.2.13")
 
 # ========== 教科マスタ（固定） ==========
 SUBJECT_MASTER = {
@@ -63,14 +63,18 @@ class ScheduleRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": "学校時間割最適化API v2.2.12（サンプルデータに総合を含む）"}
+    return {"message": "学校時間割最適化API v2.2.13（制度設計版）"}
 
 @app.post("/optimize")
 def optimize_schedule(request: ScheduleRequest):
     """
-    時間割最適化エンドポイント（v2.2.12）
+    時間割最適化エンドポイント（v2.2.13・制度設計版）
     
-    正しい優先順位：
+    制度設計：
+    - 教員が複数クラスを担当する場合、各クラスで個別に配置
+    - 例：教員1（国語・1-1,1-2,1-3）→ 3個の スケジュール対象
+    
+    優先順位：
     1. 特別活動（道徳・学活・総合）→ 学年一斉で固定
     2. 技能教科（保体・理科・音楽・美術・技術・家庭）→ 特別教室が限られている
     3. 基礎5教科（国語・社会・数学・英語）→ 普通教室で自由に配置
@@ -81,17 +85,7 @@ def optimize_schedule(request: ScheduleRequest):
     - NG時間帯
     - 施設上限
     - 学年一斉コマ
-    
-    サンプルグループスロット（GASから送信）：
-    - 1年・木・1・道徳
-    - 2年・金・1・道徳
-    - 3年・月・1・道徳
-    - 1年・月・6・学活
-    - 2年・火・6・学活
-    - 3年・水・5・学活
-    - 1年・金・6・総合 ← 新規追加
-    - 2年・月・6・総合 ← 新規追加
-    - 3年・木・6・総合 ← 新規追加
+    - 1日1クラス1教科1コマ（特別活動を除く）
     """
     
     try:
@@ -106,16 +100,26 @@ def optimize_schedule(request: ScheduleRequest):
         all_classes = sorted(list(all_classes))
         
         print(f"DEBUG: classes={all_classes}")
+        print(f"DEBUG: num_classes={len(all_classes)}")
         
-        # 教科別に教員を分類
+        # 教科別に教員を分類（各クラスごと）
         subject_teachers = {}
         for teacher in request.teachers:
             if teacher.subject not in subject_teachers:
                 subject_teachers[teacher.subject] = []
-            subject_teachers[teacher.subject].append(teacher)
+            
+            # 教員が複数クラスを担当する場合、各クラスごとに分割
+            for class_name in teacher.classes:
+                subject_teachers[teacher.subject].append({
+                    'id': teacher.id,
+                    'name': teacher.name,
+                    'subject': teacher.subject,
+                    'class': class_name,
+                    'original_classes': teacher.classes,
+                    'total_hours': teacher.hours
+                })
         
         print(f"DEBUG: subjects={list(subject_teachers.keys())}")
-        print(f"DEBUG: group_slots={request.group_slots}")
         
         # 各クラスの時間割グリッドを初期化
         class_timetable = {}
@@ -125,7 +129,7 @@ def optimize_schedule(request: ScheduleRequest):
                 class_timetable[class_name][day] = {}
                 for period in periods:
                     if day in short_days and period == 6:
-                        class_timetable[class_name][day][period] = "BLOCKED"  # 水曜の6限は配置不可
+                        class_timetable[class_name][day][period] = "BLOCKED"
                     else:
                         class_timetable[class_name][day][period] = None
         
@@ -150,10 +154,10 @@ def optimize_schedule(request: ScheduleRequest):
             group_slots_by_time[key] = gs.subject
         
         # ========== ステップ1: 特別活動を配置（学年一斉コマのみ） ==========
-        print("DEBUG: ========== ステップ1: 特別活動を配置（学年一斉コマのみ） ==========")
+        print("DEBUG: ========== ステップ1: 特別活動を配置 ==========")
         
         for class_name in all_classes:
-            grade = class_name[0]  # "1-1" -> "1"
+            grade = class_name[0]
             grade_key = f"{grade}年"
             required_subjects = SUBJECT_MASTER.get(grade_key, {})
             
@@ -163,7 +167,6 @@ def optimize_schedule(request: ScheduleRequest):
                 
                 placed_count = 0
                 
-                # 学年一斉コマに設定されたものだけを配置
                 for (target_grade, target_day, target_period), target_subject in group_slots_by_time.items():
                     if target_grade != grade or target_subject != subject:
                         continue
@@ -171,30 +174,29 @@ def optimize_schedule(request: ScheduleRequest):
                     if class_timetable[class_name][target_day][target_period] is not None:
                         continue
                     
-                    # 利用可能な教員を探す（担当教員を優先）
                     available_teacher = None
                     if subject in subject_teachers:
-                        for teacher in subject_teachers[subject]:
-                            if class_name not in teacher.classes:
+                        for teacher_entry in subject_teachers[subject]:
+                            if teacher_entry['class'] != class_name:
                                 continue
                             
-                            if (teacher.id, target_day, target_period) in ng_set:
+                            if (teacher_entry['id'], target_day, target_period) in ng_set:
                                 continue
                             
-                            if teacher_hours_used[teacher.id] >= teacher.hours:
+                            if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
                                 continue
                             
-                            available_teacher = teacher
+                            available_teacher = teacher_entry
                             break
                     
                     if available_teacher:
-                        class_timetable[class_name][target_day][target_period] = f"{subject}|{available_teacher.name}"
-                        teacher_hours_used[available_teacher.id] += 1
+                        class_timetable[class_name][target_day][target_period] = f"{subject}|{available_teacher['name']}"
+                        teacher_hours_used[available_teacher['id']] += 1
                         placed_count += 1
                 
                 print(f"DEBUG: {class_name} {subject}={placed_count}（学年一斉コマのみ）")
         
-        # ========== ステップ2: 技能教科を配置（特別教室が被らないように・1日1コマ制限） ==========
+        # ========== ステップ2: 技能教科を配置 ==========
         print("DEBUG: ========== ステップ2: 技能教科を配置 ==========")
         
         for class_name in all_classes:
@@ -218,24 +220,22 @@ def optimize_schedule(request: ScheduleRequest):
                 placed_count = 0
                 
                 for _ in range(needed):
-                    # ========== 先に1日1コマ制限に違反しないスロットを全て絞る ==========
+                    # スロットを先に絞る
                     valid_slots = []
                     for day in days:
                         for period in periods:
                             if class_timetable[class_name][day][period] is not None:
-                                continue  # 既に埋まっている
+                                continue
                             
                             if day in short_days and period == 6:
-                                continue  # 水曜の6限
+                                continue
                             
-                            # この日にこの教科がまだ配置されていないかチェック
                             same_subject_count_today = sum(1 for p in periods 
                                                           if class_timetable[class_name][day].get(p) and 
                                                           subject in str(class_timetable[class_name][day].get(p)))
                             if same_subject_count_today > 0:
-                                continue  # この日はこの教科が既にあるのでスキップ
+                                continue
                             
-                            # 連続チェック
                             prev_subject = None
                             next_subject = None
                             if period > 1:
@@ -250,7 +250,6 @@ def optimize_schedule(request: ScheduleRequest):
                             if prev_subject == subject or next_subject == subject:
                                 continue
                             
-                            # 施設上限をチェック
                             if subject in facility_limits:
                                 current_facility_usage = sum(1 for c in all_classes 
                                                             for p in periods 
@@ -265,30 +264,28 @@ def optimize_schedule(request: ScheduleRequest):
                         print(f"DEBUG: {class_name} {subject}: 有効なスロットなし")
                         break
                     
-                    # ランダムにスロットを選ぶ
                     random.shuffle(valid_slots)
                     
                     placed = False
                     for day, period in valid_slots:
-                        # 利用可能な教員を探す
                         available_teacher = None
                         if subject in subject_teachers:
-                            for teacher in subject_teachers[subject]:
-                                if class_name not in teacher.classes:
+                            for teacher_entry in subject_teachers[subject]:
+                                if teacher_entry['class'] != class_name:
                                     continue
                                 
-                                if (teacher.id, day, period) in ng_set:
+                                if (teacher_entry['id'], day, period) in ng_set:
                                     continue
                                 
-                                if teacher_hours_used[teacher.id] >= teacher.hours:
+                                if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
                                     continue
                                 
-                                available_teacher = teacher
+                                available_teacher = teacher_entry
                                 break
                         
                         if available_teacher:
-                            class_timetable[class_name][day][period] = f"{subject}|{available_teacher.name}"
-                            teacher_hours_used[available_teacher.id] += 1
+                            class_timetable[class_name][day][period] = f"{subject}|{available_teacher['name']}"
+                            teacher_hours_used[available_teacher['id']] += 1
                             placed = True
                             placed_count += 1
                             break
@@ -299,7 +296,7 @@ def optimize_schedule(request: ScheduleRequest):
                 
                 print(f"DEBUG: {class_name} {subject}={placed_count}/{needed}")
         
-        # ========== ステップ3: 基礎5教科を配置（1日1クラス1教科1コマ制限） ==========
+        # ========== ステップ3: 基礎5教科を配置 ==========
         print("DEBUG: ========== ステップ3: 基礎5教科を配置 ==========")
         
         for class_name in all_classes:
@@ -323,24 +320,21 @@ def optimize_schedule(request: ScheduleRequest):
                 placed_count = 0
                 
                 for _ in range(needed):
-                    # ========== 先に1日1コマ制限に違反しないスロットを全て絞る ==========
                     valid_slots = []
                     for day in days:
                         for period in periods:
                             if class_timetable[class_name][day][period] is not None:
-                                continue  # 既に埋まっている
+                                continue
                             
                             if day in short_days and period == 6:
-                                continue  # 水曜の6限
+                                continue
                             
-                            # この日にこの教科がまだ配置されていないかチェック
                             same_subject_count_today = sum(1 for p in periods 
                                                           if class_timetable[class_name][day].get(p) and 
                                                           subject in str(class_timetable[class_name][day].get(p)))
                             if same_subject_count_today > 0:
-                                continue  # この日はこの教科が既にあるのでスキップ
+                                continue
                             
-                            # 連続チェック
                             prev_subject = None
                             next_subject = None
                             if period > 1:
@@ -361,30 +355,28 @@ def optimize_schedule(request: ScheduleRequest):
                         print(f"DEBUG: {class_name} {subject}: 有効なスロットなし")
                         break
                     
-                    # ランダムにスロットを選ぶ
                     random.shuffle(valid_slots)
                     
                     placed = False
                     for day, period in valid_slots:
-                        # 利用可能な教員を探す
                         available_teacher = None
                         if subject in subject_teachers:
-                            for teacher in subject_teachers[subject]:
-                                if class_name not in teacher.classes:
+                            for teacher_entry in subject_teachers[subject]:
+                                if teacher_entry['class'] != class_name:
                                     continue
                                 
-                                if (teacher.id, day, period) in ng_set:
+                                if (teacher_entry['id'], day, period) in ng_set:
                                     continue
                                 
-                                if teacher_hours_used[teacher.id] >= teacher.hours:
+                                if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
                                     continue
                                 
-                                available_teacher = teacher
+                                available_teacher = teacher_entry
                                 break
                         
                         if available_teacher:
-                            class_timetable[class_name][day][period] = f"{subject}|{available_teacher.name}"
-                            teacher_hours_used[available_teacher.id] += 1
+                            class_timetable[class_name][day][period] = f"{subject}|{available_teacher['name']}"
+                            teacher_hours_used[available_teacher['id']] += 1
                             placed = True
                             placed_count += 1
                             break
