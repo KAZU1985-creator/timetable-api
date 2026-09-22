@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 import random
 
-app = FastAPI(title="学校時間割最適化 API", version="2.2.11")
+app = FastAPI(title="学校時間割最適化 API", version="2.2.12")
 
 # ========== 教科マスタ（固定） ==========
 SUBJECT_MASTER = {
@@ -21,8 +21,14 @@ FACILITY_SUBJECTS = {
     '技術': '技術室'
 }
 
-# ========== 特別活動 ==========
+# ========== 特別活動（道徳・学活・総合） ==========
 SPECIAL_ACTIVITIES = ['道徳', '学活', '総合']
+
+# ========== 技能教科（特別教室が必要）==========
+SKILL_SUBJECTS = ['保体', '理科', '音楽', '美術', '技術', '家庭']
+
+# ========== 基礎5教科 ==========
+CORE_SUBJECTS = ['国語', '社会', '数学', '英語']
 
 class TeacherAssignment(BaseModel):
     id: int
@@ -57,22 +63,35 @@ class ScheduleRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": "学校時間割最適化API v2.2.11（正しい優先順位版）"}
+    return {"message": "学校時間割最適化API v2.2.12（サンプルデータに総合を含む）"}
 
 @app.post("/optimize")
 def optimize_schedule(request: ScheduleRequest):
     """
-    時間割最適化エンドポイント
+    時間割最適化エンドポイント（v2.2.12）
     
-    正しい優先順位（v2.2.11）:
+    正しい優先順位：
     1. 特別活動（道徳・学活・総合）→ 学年一斉で固定
-    2. 技能教科（保体・理科・音楽・美術・技術）→ 特別教室が限られている
+    2. 技能教科（保体・理科・音楽・美術・技術・家庭）→ 特別教室が限られている
     3. 基礎5教科（国語・社会・数学・英語）→ 普通教室で自由に配置
     
-    今後の拡張性：
-    - 教員の出張・会議
-    - 非常勤講師の時間制限
-    - 休暇予定
+    制約：
+    - 同一教科の連続配置を禁止
+    - 教員の週コマ数制限
+    - NG時間帯
+    - 施設上限
+    - 学年一斉コマ
+    
+    サンプルグループスロット（GASから送信）：
+    - 1年・木・1・道徳
+    - 2年・金・1・道徳
+    - 3年・月・1・道徳
+    - 1年・月・6・学活
+    - 2年・火・6・学活
+    - 3年・水・5・学活
+    - 1年・金・6・総合 ← 新規追加
+    - 2年・月・6・総合 ← 新規追加
+    - 3年・木・6・総合 ← 新規追加
     """
     
     try:
@@ -96,6 +115,7 @@ def optimize_schedule(request: ScheduleRequest):
             subject_teachers[teacher.subject].append(teacher)
         
         print(f"DEBUG: subjects={list(subject_teachers.keys())}")
+        print(f"DEBUG: group_slots={request.group_slots}")
         
         # 各クラスの時間割グリッドを初期化
         class_timetable = {}
@@ -237,15 +257,12 @@ def optimize_schedule(request: ScheduleRequest):
         # ========== ステップ2: 技能教科を配置（特別教室が被らないように） ==========
         print("DEBUG: ========== ステップ2: 技能教科を配置 ==========")
         
-        skill_subjects = list(FACILITY_SUBJECTS.keys())
-        skill_subjects.extend(['家庭'])  # 家庭科も技能教科扱い
-        
         for class_name in all_classes:
             grade = class_name[0]
             grade_key = f"{grade}年"
             required_subjects = SUBJECT_MASTER.get(grade_key, {})
             
-            for subject in skill_subjects:
+            for subject in SKILL_SUBJECTS:
                 if subject not in required_subjects:
                     continue
                 
@@ -327,14 +344,12 @@ def optimize_schedule(request: ScheduleRequest):
         # ========== ステップ3: 基礎5教科を配置 ==========
         print("DEBUG: ========== ステップ3: 基礎5教科を配置 ==========")
         
-        core_subjects = ['国語', '社会', '数学', '英語']  # 理科は技能教科に含まれるため外す
-        
         for class_name in all_classes:
             grade = class_name[0]
             grade_key = f"{grade}年"
             required_subjects = SUBJECT_MASTER.get(grade_key, {})
             
-            for subject in core_subjects:
+            for subject in CORE_SUBJECTS:
                 if subject not in required_subjects:
                     continue
                 
@@ -420,6 +435,15 @@ def optimize_schedule(request: ScheduleRequest):
                             "subject": subject,
                             "teacher_name": teacher_name
                         })
+        
+        # クラスごとの教科統計を出力
+        for class_name in all_classes:
+            subject_counts = {}
+            for item in schedule:
+                if item["class"] == class_name:
+                    subj = item["subject"]
+                    subject_counts[subj] = subject_counts.get(subj, 0) + 1
+            print(f"DEBUG: {class_name}={subject_counts}")
         
         print(f"DEBUG: total_schedule={len(schedule)}")
         
