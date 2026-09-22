@@ -1,36 +1,51 @@
+"""
+学校時間割最適化 API v2.2.16
+
+v2.2.15 からの主な変更
+  1. 教員被りチェックを修正
+     旧: 「その教科を持つ全学年の先生」の他クラスを見ていた
+         → 1年国語と2年国語（別の先生）も同時に置けず、実質「全校で1クラスまで」になっていた
+     新: 先生ごとの「空き/使用中」表で判定（特別活動も含めて、同じ先生は同じ限に1か所だけ）
+  2. 学年一斉コマ（道徳・学活・総合）を最初に確保
+     旧: Python側で空き扱い → 国語などが置かれ、GASで上書きされて消えていた
+  3. 基礎教科（国語・社会・数学・英語）のデフォルト施設上限1を撤廃
+     施設上限は GAS の設定シートに書いた教科だけに適用
+  4. 「（補填）」配置を廃止
+     先生なしで置くと教員被りを作るため。代わりに、置けない授業は
+     既存の授業をずらして空きを作る「押し出し修復」で入れる
+  5. 教科マスタ・5時間授業の曜日・特別活動の担当を GAS から受け取れるように
+  6. 置けなかった授業を unplaced として返す（理由付き）
+"""
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import random
-import copy
+import time
 
-app = FastAPI(title="学校時間割最適化 API", version="2.2.15")
+VERSION = "2.2.16"
+app = FastAPI(title="学校時間割最適化 API", version=VERSION)
 
-# ========== 教科マスタ（固定） ==========
-SUBJECT_MASTER = {
-    '1年': {'国語': 4, '社会': 4, '数学': 4, '理科': 3, '英語': 3, '音楽': 1, '美術': 1, '保体': 1, '技術': 1, '家庭': 1, '学活': 1, '総合': 1, '道徳': 1},
-    '2年': {'国語': 4, '社会': 4, '数学': 4, '理科': 3, '英語': 3, '音楽': 1, '美術': 1, '保体': 1, '技術': 1, '家庭': 1, '学活': 1, '総合': 1, '道徳': 1},
-    '3年': {'国語': 4, '社会': 4, '数学': 4, '理科': 3, '英語': 3, '音楽': 1, '美術': 1, '保体': 1, '技術': 1, '家庭': 1, '学活': 1, '総合': 1, '道徳': 1},
+DAYS = ["月", "火", "水", "木", "金"]
+PERIODS = [1, 2, 3, 4, 5, 6]
+SPECIAL_ACTIVITIES = ["道徳", "学活", "総合"]
+
+# GAS から教科マスタが送られてこない場合の既定値
+DEFAULT_SUBJECT_MASTER = {
+    g: {"国語": 4, "社会": 4, "数学": 4, "理科": 3, "英語": 3,
+        "音楽": 1, "美術": 1, "保体": 1, "技術": 1, "家庭": 1,
+        "学活": 1, "総合": 1, "道徳": 1}
+    for g in ["1年", "2年", "3年"]
 }
 
-# ========== 特別活動（道徳・学活・総合） ==========
-SPECIAL_ACTIVITIES = ['道徳', '学活', '総合']
 
-# ========== 技能教科（優先度付き・少ないコマ順） ==========
-SKILL_SUBJECTS = ['音楽', '美術', '家庭', '技術', '保体', '理科']
-
-# ========== 基礎5教科（優先度付き・少ないコマ順） ==========
-CORE_SUBJECTS = ['英語', '数学', '社会', '国語']
-
+# ========== リクエスト定義（v2.2.15 と互換。新項目はすべて省略可） ==========
 class TeacherAssignment(BaseModel):
     id: int
     name: str
     subject: str
     classes: List[str]
     hours: int
-    
-    class Config:
-        use_enum_values = True
+
 
 class NGItem(BaseModel):
     target_type: str
@@ -38,687 +53,413 @@ class NGItem(BaseModel):
     day: str
     period: int
 
+
 class GroupSlot(BaseModel):
     grade: str
     day: str
     period: int
     subject: str
 
+
+class SpecialTeacher(BaseModel):
+    subject: str
+    class_name: str
+    teacher_name: str
+    teacher_id: Optional[int] = None
+
+
 class ScheduleRequest(BaseModel):
     teachers: List[TeacherAssignment]
     ng_list: Optional[List[NGItem]] = []
     group_slots: Optional[List[GroupSlot]] = []
-    short_days: Optional[List[str]] = []
+    short_days: Optional[List[str]] = None
+    special_teachers: Optional[List[SpecialTeacher]] = []
+    subject_hours: Optional[Dict[str, Dict[str, int]]] = None
+    facility_limits: Optional[Dict[str, int]] = {}
     require_full: Optional[bool] = True
     max_consecutive: Optional[int] = 4
     max_teacher_daily_hours: Optional[int] = 5
-    facility_limits: Optional[Dict[str, int]] = {}
     total_hours: Optional[int] = 29
-    time_limit: Optional[float] = 60.0
+    time_limit: Optional[float] = 20.0
+
 
 @app.get("/")
 def read_root():
-    return {"message": "学校時間割最適化API v2.2.15（複数試行 + 優先度付き配置版）"}
+    return {"message": f"学校時間割最適化API v{VERSION}（教員被り修正 + 押し出し修復版）"}
 
-def try_place_subject(class_timetable, class_name, subject, 
-                      subject_teachers, teacher_hours_used, teacher_class_hours_used,
-                      ng_set, facility_limits, short_days, all_classes=None):
-    """
-    1コマ分の教科を配置する（曜日優先度で試す）
-    戻り値: 配置成功 (True/False)
-    """
-    days = ["月", "火", "水", "木", "金"]
-    periods = [1, 2, 3, 4, 5, 6]
-    
-    if all_classes is None:
-        all_classes = list(class_timetable.keys())
-    
-    # 有効なスロットを収集（曜日別）
-    valid_slots_by_day = {day: [] for day in days}
-    
-    for day in days:
-        for period in periods:
-            if class_timetable[class_name][day][period] is not None:
-                continue
-            
-            if day in short_days and period == 6:
-                continue
-            
-            # 同一曜日に同一教科が既にあるか
-            same_subject_count_today = sum(1 for p in periods 
-                                          if class_timetable[class_name][day].get(p) and 
-                                          subject in str(class_timetable[class_name][day].get(p)))
-            if same_subject_count_today > 0:
-                continue
-            
-            # 連続配置チェック（より厳密に）
-            prev_subject = None
-            next_subject = None
-            if period > 1:
-                prev_val = class_timetable[class_name][day].get(period - 1)
-                if prev_val and prev_val != "BLOCKED":
-                    prev_subject = prev_val.split('|')[0]
-            if period < 6:
-                next_val = class_timetable[class_name][day].get(period + 1)
-                if next_val and next_val != "BLOCKED":
-                    next_subject = next_val.split('|')[0]
-            
-            # ★同じ教科が連続で配置されていないかチェック
-            if prev_subject == subject or next_subject == subject:
-                continue
-            
-            # ★同じ教員の複数クラスが同じ限に配置されていないかチェック
-            same_teacher_same_period = False
-            if subject in subject_teachers:
-                for teacher_entry in subject_teachers[subject]:
-                    # この教員が複数クラスを担当しているか
-                    teacher_classes = teacher_entry.get('original_classes', [])
-                    if len(teacher_classes) > 1:
-                        # この教員の別のクラスが同じ限に同じ教科を配置していないかチェック
-                        for other_class in teacher_classes:
-                            if other_class == class_name:
-                                continue
-                            other_slot = class_timetable[other_class][day].get(period)
-                            if other_slot and other_slot != "BLOCKED" and subject in str(other_slot):
-                                same_teacher_same_period = True
-                                break
-                    if same_teacher_same_period:
-                        break
-            
-            if same_teacher_same_period:
-                continue
-            
-            # 施設上限チェック（★「曜日+限」単位で制限）
-            if subject in facility_limits:
-                current_facility_usage = sum(1 for c in all_classes 
-                                            if class_timetable[c][day].get(period) and 
-                                            subject in str(class_timetable[c][day].get(period)))
-                if current_facility_usage >= facility_limits[subject]:
-                    continue
-            
-            valid_slots_by_day[day].append(period)
-    
-    # ★曜日バランス重視：全曜日を同等に扱う（ランダム化）
-    # （金→木優先を廃止し、月火水木金に均等に分散させる）
-    all_valid_slots = []
-    for day in days:
-        for period in valid_slots_by_day[day]:
-            all_valid_slots.append((day, period))
-    
-    if not all_valid_slots:
-        return False
-    
-    # ★ランダムに選ぶ（曜日優先度なし）
-    random.shuffle(all_valid_slots)
-    
-    for day, period in all_valid_slots:
-        # ★配置前に連続配置をチェック
-        prev_subject = None
-        next_subject = None
-        if period > 1:
-            prev_val = class_timetable[class_name][day].get(period - 1)
-            if prev_val and prev_val != "BLOCKED":
-                prev_subject = prev_val.split('|')[0]
-        if period < 6:
-            next_val = class_timetable[class_name][day].get(period + 1)
-            if next_val and next_val != "BLOCKED":
-                next_subject = next_val.split('|')[0]
-        
-        if prev_subject == subject or next_subject == subject:
-            continue  # この(day, period)はスキップ
-        
-        # ★配置前に施設上限を再度チェック（念のため）
-        if subject in facility_limits:
-            current_facility_usage = sum(1 for c in all_classes 
-                                        if class_timetable[c][day].get(period) and 
-                                        subject in str(class_timetable[c][day].get(period)))
-            if current_facility_usage >= facility_limits[subject]:
-                continue  # 施設上限に達していればスキップ
-        
-        # 利用可能な教員を探す
-        available_teacher = None
-        if subject in subject_teachers:
-            for teacher_entry in subject_teachers[subject]:
-                if teacher_entry['class'] != class_name:
-                    continue
-                
-                if (teacher_entry['id'], day, period) in ng_set:
-                    continue
-                
-                if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
-                    continue
-                
-                if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
-                    continue
-                
-                available_teacher = teacher_entry
-                break
-        
-        if available_teacher:
-            class_timetable[class_name][day][period] = f"{subject}|{available_teacher['name']}"
-            teacher_hours_used[available_teacher['id']] += 1
-            teacher_class_hours_used[(available_teacher['id'], class_name)] += 1
-            return True
-    
-    return False
 
-def optimize_schedule_single(normalized_teachers, ng_set, facility_limits, group_slots_by_time, short_days):
-    """
-    1回の試行を実行して、時間割を返す
-    """
-    days = ["月", "火", "水", "木", "金"]
-    periods = [1, 2, 3, 4, 5, 6]
-    
-    # 全クラスを取得
-    all_classes = set()
-    for teacher in normalized_teachers:
-        all_classes.update(teacher['classes'])
-    all_classes = sorted(list(all_classes))
-    
-    # 教科別に教員を分類（各クラスごと）
-    subject_teachers = {}
-    for teacher in normalized_teachers:
-        if teacher['subject'] not in subject_teachers:
-            subject_teachers[teacher['subject']] = []
-        
-        hours_per_class = teacher['hours'] // len(teacher['classes']) if teacher['classes'] else teacher['hours']
-        
-        for class_name in teacher['classes']:
-            subject_teachers[teacher['subject']].append({
-                'id': teacher['id'],
-                'name': teacher['name'],
-                'subject': teacher['subject'],
-                'class': class_name,
-                'original_classes': teacher['classes'],
-                'total_hours': teacher['hours'],
-                'max_hours_this_class': hours_per_class
-            })
-    
-    # 各クラスの時間割グリッドを初期化
-    class_timetable = {}
-    for class_name in all_classes:
-        class_timetable[class_name] = {}
-        for day in days:
-            class_timetable[class_name][day] = {}
-            for period in periods:
-                if day in short_days and period == 6:
-                    class_timetable[class_name][day][period] = "BLOCKED"
-                else:
-                    class_timetable[class_name][day][period] = None
-    
-    # 教員の使用時間数を追跡
-    teacher_hours_used = {}
-    teacher_class_hours_used = {}
-    for teacher in normalized_teachers:
-        teacher_hours_used[teacher['id']] = 0
-        for class_name in teacher['classes']:
-            teacher_class_hours_used[(teacher['id'], class_name)] = 0
-    
-    # ========== ステップ1: 特別活動を配置 ==========
-    for class_name in all_classes:
-        grade = class_name[0]
-        grade_key = f"{grade}年"
-        required_subjects = SUBJECT_MASTER.get(grade_key, {})
-        
-        for subject in SPECIAL_ACTIVITIES:
-            if subject not in required_subjects:
-                continue
-            
-            for (target_grade, target_day, target_period), target_subject in group_slots_by_time.items():
-                if target_grade != grade or target_subject != subject:
-                    continue
-                
-                if class_timetable[class_name][target_day][target_period] is not None:
-                    continue
-                
-                available_teacher = None
-                if subject in subject_teachers:
-                    for teacher_entry in subject_teachers[subject]:
-                        if teacher_entry['class'] != class_name:
-                            continue
-                        
-                        if (teacher_entry['id'], target_day, target_period) in ng_set:
-                            continue
-                        
-                        if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
-                            continue
-                        
-                        if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
-                            continue
-                        
-                        available_teacher = teacher_entry
-                        break
-                
-                if available_teacher:
-                    class_timetable[class_name][target_day][target_period] = f"{subject}|{available_teacher['name']}"
-                    teacher_hours_used[available_teacher['id']] += 1
-                    teacher_class_hours_used[(available_teacher['id'], class_name)] += 1
-    
-    # ========== ステップ2: 技能教科を配置（優先度付き・少ないコマ順） ==========
-    for class_name in all_classes:
-        grade = class_name[0]
-        grade_key = f"{grade}年"
-        required_subjects = SUBJECT_MASTER.get(grade_key, {})
-        
-        for subject in SKILL_SUBJECTS:  # ★優先度付き
-            if subject not in required_subjects:
-                continue
-            
-            required_hours = required_subjects[subject]
-            current_count = sum(1 for day in days for period in periods 
-                              if class_timetable[class_name][day].get(period) and 
-                              subject in str(class_timetable[class_name][day].get(period)))
-            
-            needed = required_hours - current_count
-            if needed <= 0:
-                continue
-            
-            for _ in range(needed):
-                # ★新しい関数で配置を試みる（曜日優先度を守る）
-                placed = try_place_subject(
-                    class_timetable, class_name, subject,
-                    subject_teachers, teacher_hours_used, teacher_class_hours_used,
-                    ng_set, facility_limits, short_days, all_classes
-                )
-                if not placed:
-                    break
-    
-    # ========== ステップ3: 基礎5教科を配置（優先度付き・少ないコマ順） ==========
-    for class_name in all_classes:
-        grade = class_name[0]
-        grade_key = f"{grade}年"
-        required_subjects = SUBJECT_MASTER.get(grade_key, {})
-        
-        for subject in CORE_SUBJECTS:  # ★優先度付き
-            if subject not in required_subjects:
-                continue
-            
-            required_hours = required_subjects[subject]
-            current_count = sum(1 for day in days for period in periods 
-                              if class_timetable[class_name][day].get(period) and 
-                              subject in str(class_timetable[class_name][day].get(period)))
-            
-            needed = required_hours - current_count
-            if needed <= 0:
-                continue
-            
-            for _ in range(needed):
-                # ★新しい関数で配置を試みる（曜日優先度を守る）
-                placed = try_place_subject(
-                    class_timetable, class_name, subject,
-                    subject_teachers, teacher_hours_used, teacher_class_hours_used,
-                    ng_set, facility_limits, short_days, all_classes
-                )
-                if not placed:
-                    break
-    
-    # ========== 結果を配列に変換 ==========
-    schedule = []
-    for class_name in all_classes:
-        for day in days:
-            for period in periods:
-                slot_value = class_timetable[class_name][day][period]
-                if slot_value and slot_value != "BLOCKED":
-                    subject, teacher_name = slot_value.split('|')
-                    schedule.append({
-                        "class": class_name,
-                        "day": day,
-                        "period": period,
-                        "subject": subject,
-                        "teacher_name": teacher_name
-                    })
-    
-    return schedule
+def grade_of(class_name: str) -> str:
+    """'1-2' → '1年'"""
+    return f"{str(class_name).strip()[0]}年"
 
-def count_violations(schedule, facility_limits, all_classes):
-    """
-    制約違反の数をカウント（より厳密に）
-    - 同じ限に同じ教科が複数クラス配置されている（横かぶり）
-    - 同じクラスで同じ教科が連続している（縦かぶり）
-    - 同じ教員が同じ限に複数クラスを教えている
-    """
-    days = ["月", "火", "水", "木", "金"]
-    periods = [1, 2, 3, 4, 5, 6]
-    
-    violation_count = 0
-    
-    # 違反1：施設上限違反をカウント（横かぶり）
-    for day in days:
-        for period in periods:
-            for subject, limit in facility_limits.items():
-                count = sum(1 for item in schedule 
-                           if item['day'] == day and item['period'] == period and item['subject'] == subject)
-                if count > limit:
-                    # ★超過分を全てカウント
-                    violation_count += (count - limit)
-    
-    # 違反2：連続配置違反をカウント（縦かぶり）
-    for class_name in all_classes:
-        for day in days:
-            for period in range(1, 6):  # 1-5限（6限の次はない）
-                item1 = next((x for x in schedule if x['class'] == class_name and x['day'] == day and x['period'] == period), None)
-                item2 = next((x for x in schedule if x['class'] == class_name and x['day'] == day and x['period'] == period + 1), None)
-                
-                if item1 and item2 and item1['subject'] == item2['subject']:
-                    violation_count += 1
-    
-    # 違反3：同じ教員が複数クラスで同じ限に配置
-    for day in days:
-        for period in periods:
-            teacher_subjects = {}  # 教員 -> (教科, クラス) のマッピング
-            
-            for item in schedule:
-                if item['day'] != day or item['period'] != period:
-                    continue
-                
-                # teacher_name から教員を特定（簡易版）
-                teacher_name = item.get('teacher_name', '')
-                subject = item['subject']
-                class_name = item['class']
-                
-                if teacher_name not in teacher_subjects:
-                    teacher_subjects[teacher_name] = []
-                
-                teacher_subjects[teacher_name].append((subject, class_name))
-            
-            # 同じ教員が同じ限に複数クラスを教えていないか確認
-            for teacher_name, subject_classes in teacher_subjects.items():
-                for subject, class_name in subject_classes:
-                    # この教員が同じ限に同じ教科を別のクラスで教えているか
-                    for other_subject, other_class in subject_classes:
-                        if class_name != other_class and subject == other_subject:
-                            violation_count += 1
-                            break  # 1クラスの重複は1回だけカウント
-    
-    return violation_count
 
-def calculate_fill_rate(schedule, all_classes, days, short_days):
-    """充填率を計算（0.0-1.0）"""
-    total_possible = 0
-    filled = len(schedule)
-    
-    for _ in all_classes:
-        for day in days:
-            if day in short_days:
-                total_possible += 5  # 月火水木金 の1-5限
+# ========== 問題データ ==========
+class Problem:
+    def __init__(self, req: ScheduleRequest):
+        self.warnings: List[str] = []
+        self.short_days = req.short_days if req.short_days else ["水"]
+        self.master = req.subject_hours or DEFAULT_SUBJECT_MASTER
+
+        # 施設上限：送られてきた教科だけ（基礎教科のデフォルト上限は付けない）
+        self.facility = {s: int(v) for s, v in (req.facility_limits or {}).items() if int(v) > 0}
+
+        # 教員
+        self.teachers = []
+        for t in req.teachers:
+            classes = [c.strip() for c in t.classes if str(c).strip()]
+            if t.id <= 0 or not classes:
+                continue
+            self.teachers.append({"id": int(t.id), "name": t.name.strip(),
+                                  "subject": t.subject.strip(), "classes": classes,
+                                  "hours": int(t.hours)})
+        self.name_to_id = {t["name"]: t["id"] for t in self.teachers}
+
+        self.classes = sorted({c for t in self.teachers for c in t["classes"]})
+
+        # 各クラスで使えるコマ
+        self.slots = [(d, p) for d in DAYS for p in PERIODS
+                      if not (d in self.short_days and p == 6)]
+
+        # NG（先生キー, 曜日, 限）
+        self.ng = set()
+        for ng in req.ng_list or []:
+            if ng.target_type == "teacher":
+                try:
+                    self.ng.add((int(ng.target_id), ng.day, int(ng.period)))
+                except ValueError:
+                    pass
+
+        # 学年一斉コマ
+        self.group = {}  # (学年, 曜日, 限) → 教科
+        for gs in req.group_slots or []:
+            g = str(gs.grade).replace("年", "").strip() + "年"
+            self.group[(g, gs.day, int(gs.period))] = gs.subject.strip()
+
+        # 特別活動の担当（教科, クラス）→ (先生キー, 先生名)
+        self.special_teacher = {}
+        for st in req.special_teachers or []:
+            tid = st.teacher_id if st.teacher_id else self.name_to_id.get(st.teacher_name.strip())
+            key = tid if tid else f"name:{st.teacher_name.strip()}"
+            self.special_teacher[(st.subject.strip(), st.class_name.strip())] = (key, st.teacher_name.strip())
+
+        # 配置すべき授業（1コマ = 1ユニット）
+        self.units = []           # dict(class, subject, tkey, tname)
+        self.no_teacher = []      # 担当教員が見つからない授業
+        for c in self.classes:
+            g = grade_of(c)
+            need = dict(self.master.get(g, {}))
+            # マスタにない教科（選択教科など）は教員の週コマ数から推定
+            for t in self.teachers:
+                if c in t["classes"] and t["subject"] not in need:
+                    need[t["subject"]] = t["hours"] // len(t["classes"])
+            for subj, hours in need.items():
+                if subj in SPECIAL_ACTIVITIES or hours <= 0:
+                    continue
+                teacher = next((t for t in self.teachers
+                                if t["subject"] == subj and c in t["classes"]), None)
+                if teacher is None:
+                    for _ in range(hours):
+                        self.no_teacher.append({"class": c, "subject": subj,
+                                                "reason": "担当教員が未設定"})
+                    continue
+                for _ in range(hours):
+                    self.units.append({"class": c, "subject": subj,
+                                       "tkey": teacher["id"], "tname": teacher["name"]})
+
+        # 先生ごとの担当コマ数（配置の優先度に使う）
+        load = {}
+        for u in self.units:
+            load[u["tkey"]] = load.get(u["tkey"], 0) + 1
+        self.teacher_load = load
+
+        # ===== 事前チェック：原理的に置けないコマ数（下限）を計算 =====
+        # 下限に達したら、それ以上探しても改善しないので探索を打ち切る
+        self.lower_bound = 0
+        self.notes: List[str] = []
+        blocked = {(c, d, p) for c in self.classes for (g, d, p) in self.group
+                   if grade_of(c) == g and (d, p) in self.slots}
+
+        for c in self.classes:
+            n_units = sum(1 for u in self.units if u["class"] == c)
+            capacity = len(self.slots) - sum(1 for (cc, d, p) in blocked if cc == c)
+            if n_units > capacity:
+                self.lower_bound += n_units - capacity
+                self.warnings.append(
+                    f"{c}: 必要コマ数 {n_units} が使えるコマ {capacity} を {n_units - capacity} 超えています（教科マスタを確認）")
+            elif n_units < capacity:
+                self.notes.append(f"{c}: 教科マスタの合計が週コマ数より {capacity - n_units} 少ないため、その分は空欄になります")
+
+        for subj, lim in self.facility.items():
+            need = sum(1 for u in self.units if u["subject"] == subj)
+            if need == 0:
+                continue
+            need_classes = {u["class"] for u in self.units if u["subject"] == subj}
+            cap = sum(min(lim, sum(1 for c in need_classes if (c, d, p) not in blocked))
+                      for (d, p) in self.slots)
+            if need > cap:
+                self.lower_bound += need - cap
+                self.warnings.append(
+                    f"{subj}: 全クラスで週 {need} コマ必要ですが、施設上限 {lim} では最大 {cap} コマしか置けません"
+                    f"（{need - cap} コマは必ず不足。施設上限か教科マスタを見直してください）")
+
+
+# ========== 1回分の時間割（状態） ==========
+class State:
+    def __init__(self, prob: Problem):
+        self.P = prob
+        self.cell = {c: {s: None for s in prob.slots} for c in prob.classes}
+        self.busy = {}       # (先生キー, 曜日, 限) → クラス
+        self.fac = {}        # (教科, 曜日, 限) → 使用クラス数
+        self.daycnt = {}     # (クラス, 曜日, 教科) → コマ数
+        self.unplaced = []
+        self.log = []        # 巻き戻し用の操作ログ
+
+    # ---- 基本操作（すべてログに残す） ----
+    def _put(self, u, c, slot, fixed=False, logging=True):
+        d, p = slot
+        if logging:
+            self.log.append(("put", c, slot))
+        self.cell[c][slot] = dict(u, fixed=fixed)
+        if u["tkey"] is not None:
+            self.busy[(u["tkey"], d, p)] = c
+        self.fac[(u["subject"], d, p)] = self.fac.get((u["subject"], d, p), 0) + 1
+        k = (c, d, u["subject"])
+        self.daycnt[k] = self.daycnt.get(k, 0) + 1
+
+    def _take(self, c, slot, logging=True):
+        d, p = slot
+        u = self.cell[c][slot]
+        if logging:
+            self.log.append(("take", c, slot, u))
+        self.cell[c][slot] = None
+        if u["tkey"] is not None and self.busy.get((u["tkey"], d, p)) == c:
+            del self.busy[(u["tkey"], d, p)]
+        self.fac[(u["subject"], d, p)] -= 1
+        self.daycnt[(c, d, u["subject"])] -= 1
+        return {k: v for k, v in u.items() if k != "fixed"}
+
+    def rollback(self, mark):
+        """ログを mark の時点まで逆再生して、状態を完全に元に戻す"""
+        while len(self.log) > mark:
+            op = self.log.pop()
+            if op[0] == "put":
+                self._take(op[1], op[2], logging=False)
             else:
-                total_possible += 6  # 1-6限
-    
-    if total_possible == 0:
-        return 0.0
-    return filled / total_possible
+                u = op[3]
+                self._put({k: v for k, v in u.items() if k != "fixed"},
+                          op[1], op[2], fixed=u["fixed"], logging=False)
 
-def fill_gaps_safely(schedule, all_classes, days, short_days):
-    """
-    安全な空白埋め（必須コマ数を超えない）
-    - 不足している教科のみを埋める
-    - コマ数上限を絶対に超えない
-    - 連続配置や同一曜日の制約も守る
-    """
-    # 各クラスの時間割を辞書化
-    class_timetable = {}
-    for class_name in all_classes:
-        class_timetable[class_name] = {}
-        for day in days:
-            class_timetable[class_name][day] = {}
-            for period in range(1, 7):
-                class_timetable[class_name][day][period] = None
-    
-    # スケジュールをグリッドに戻す
-    for item in schedule:
-        class_timetable[item['class']][item['day']][item['period']] = item
-    
-    # 各クラスごとに不足を埋める
-    new_schedule = list(schedule)
-    
-    for class_name in all_classes:
-        grade = class_name[0]
-        grade_key = f"{grade}年"
-        required_subjects = SUBJECT_MASTER.get(grade_key, {})
-        
-        # 現在のコマ数を集計
-        current_counts = {}
-        for item in schedule:
-            if item['class'] == class_name:
-                current_counts[item['subject']] = current_counts.get(item['subject'], 0) + 1
-        
-        # 不足している教科を探す
-        deficit_subjects = []
-        for subject, required in required_subjects.items():
-            # ★特別活動は埋めない（学年一斉コマのみで配置）
-            if subject in SPECIAL_ACTIVITIES:
+    # ---- 制約チェック ----
+    def ok_except_occupancy(self, u, slot, ignore_teacher=False):
+        """セルの空き以外の制約（教員・NG・同日・連続・施設）を満たすか"""
+        c, s, t = u["class"], u["subject"], u["tkey"]
+        d, p = slot
+        if (t, d, p) in self.P.ng:
+            return False
+        if not ignore_teacher and (t, d, p) in self.busy:
+            return False
+        if self.daycnt.get((c, d, s), 0) > 0:          # 同じ日に同じ教科は1コマまで
+            return False
+        for q in (p - 1, p + 1):                       # 連続禁止（同日制限の保険）
+            n = self.cell[c].get((d, q))
+            if n and n["subject"] == s:
+                return False
+        lim = self.P.facility.get(s)
+        if lim is not None and self.fac.get((s, d, p), 0) >= lim:
+            return False
+        return True
+
+    def can_place(self, u, slot):
+        return self.cell[u["class"]][slot] is None and self.ok_except_occupancy(u, slot)
+
+    # ---- 学年一斉コマの確保 ----
+    def place_group_slots(self):
+        for (g, d, p), subj in self.P.group.items():
+            if (d, p) not in self.P.slots:
                 continue
-            
-            current = current_counts.get(subject, 0)
-            deficit = required - current
-            
-            # ★重要：不足分のみ（負数=超過はスキップ）
-            if deficit > 0:
-                for _ in range(deficit):
-                    deficit_subjects.append(subject)
-        
-        if not deficit_subjects:
-            continue  # このクラスに不足なし
-        
-        # 空きスロットを収集
-        empty_slots = []
-        for day in days:
-            for period in range(1, 7):
-                if day in short_days and period == 6:
+            for c in self.P.classes:
+                if grade_of(c) != g or self.cell[c][(d, p)] is not None:
                     continue
-                if class_timetable[class_name][day][period] is None:
-                    empty_slots.append((day, period))
-        
-        if not empty_slots:
-            continue  # 空きスロットなし
-        
-        # ランダムに埋める（必要な分だけ）
-        random.shuffle(empty_slots)
-        random.shuffle(deficit_subjects)
-        
-        slot_idx = 0
-        for subject in deficit_subjects:
-            if slot_idx >= len(empty_slots):
-                break  # スロット不足
-            
-            day, period = empty_slots[slot_idx]
-            
-            # ★安全チェック1：同一曜日に同じ教科がないか
-            same_subject_count = sum(1 for p in range(1, 7)
-                                    if class_timetable[class_name][day][p] 
-                                    and class_timetable[class_name][day][p]['subject'] == subject)
-            if same_subject_count > 0:
-                continue  # 同一曜日に同じ教科 → この slot を飛ばす
-            
-            # ★安全チェック2：連続配置がないか
-            prev_period = period - 1
-            next_period = period + 1
-            prev_subject = None
-            next_subject = None
-            
-            if prev_period >= 1:
-                prev_item = class_timetable[class_name][day][prev_period]
-                if prev_item:
-                    prev_subject = prev_item['subject']
-            
-            if next_period <= 6:
-                next_item = class_timetable[class_name][day][next_period]
-                if next_item:
-                    next_subject = next_item['subject']
-            
-            if prev_subject == subject or next_subject == subject:
-                continue  # 連続配置 → この slot を飛ばす
-            
-            # ★埋める
-            new_schedule.append({
-                "class": class_name,
-                "day": day,
-                "period": period,
-                "subject": subject,
-                "teacher_name": "（補填）"
-            })
-            class_timetable[class_name][day][period] = {
-                "subject": subject
-            }
-            slot_idx += 1
-    
-    return new_schedule
+                tkey, tname = self.P.special_teacher.get((subj, c), (None, ""))
+                self._put({"class": c, "subject": subj, "tkey": tkey, "tname": tname},
+                          c, (d, p), fixed=True)
+
+    # ---- 貪欲配置 ----
+    def greedy(self, units):
+        for u in units:
+            cands = [s for s in self.P.slots if self.can_place(u, s)]
+            if cands:
+                self._put(u, u["class"], random.choice(cands))
+            else:
+                self.unplaced.append(u)
+
+    # ---- 押し出し修復（ejection chain） ----
+    def insert(self, u, depth, tabu, deadline):
+        """u を置く。空きがなければ他の授業をどかして再配置（深さ depth まで）"""
+        c = u["class"]
+        slots = list(self.P.slots)
+        random.shuffle(slots)
+        for s in slots:
+            if self.can_place(u, s):
+                self._put(u, c, s)
+                return True
+        if depth == 0 or time.time() > deadline:
+            return False
+
+        for s in slots:
+            if (c, s) in tabu:
+                continue
+            occ = self.cell[c][s]
+            if occ is not None and occ["fixed"]:
+                continue
+            d, p = s
+            # このコマで u の先生が他クラスを教えている場合、その授業もどかす
+            other_c = self.busy.get((u["tkey"], d, p))
+            if other_c is not None and other_c != c:
+                oc = self.cell[other_c][s]
+                if oc is None or oc["fixed"] or (other_c, s) in tabu:
+                    continue
+            if occ is None and other_c is None:
+                continue  # 空いていて先生も空き → 別の制約で置けないコマ
+
+            mark = len(self.log)
+            removed = []
+            if occ is not None:
+                removed.append((c, s, self._take(c, s)))
+            if other_c is not None and other_c != c:
+                removed.append((other_c, s, self._take(other_c, s)))
+
+            if self.can_place(u, s):
+                self._put(u, c, s)
+                new_tabu = tabu | {(c, s)} | {(rc, rs) for rc, rs, _ in removed}
+                if all(self.insert(ru, depth - 1, new_tabu, deadline) for _, _, ru in removed):
+                    return True
+            self.rollback(mark)   # 失敗 → 連鎖で動いた分も含めて完全に元に戻す
+        return False
+
+    def repair(self, deadline, max_depth=3):
+        for depth in range(1, max_depth + 1):
+            if not self.unplaced or time.time() > deadline:
+                break
+            rest = []
+            random.shuffle(self.unplaced)
+            for u in self.unplaced:
+                if not self.insert(u, depth, frozenset(), deadline):
+                    rest.append(u)
+                self.log.clear()   # 確定した分のログは不要
+            self.unplaced = rest
+
+    # ---- 出力 ----
+    def to_schedule(self):
+        out = []
+        for c in self.P.classes:
+            for (d, p) in self.P.slots:
+                v = self.cell[c][(d, p)]
+                if v:
+                    out.append({"class": c, "day": d, "period": p,
+                                "subject": v["subject"], "teacher_name": v["tname"]})
+        return out
+
+
+def build_one(prob: Problem, deadline: float) -> State:
+    st = State(prob)
+    st.place_group_slots()
+    units = list(prob.units)
+    random.shuffle(units)
+    # 施設上限のある教科 → 担当コマの多い先生 の順に先に置く（揺らぎ付き）
+    units.sort(key=lambda u: (u["subject"] not in prob.facility,
+                              -prob.teacher_load[u["tkey"]] + random.random() * 3))
+    st.greedy(units)
+    st.log.clear()
+    st.repair(deadline)
+    return st
+
+
+# ========== 独立した検証（生成結果を別ロジックで数え直す） ==========
+def count_violations(schedule, prob: Problem):
+    v = {"教員被り": 0, "施設上限": 0, "連続配置": 0, "同日重複": 0}
+    by_slot = {}
+    for it in schedule:
+        by_slot.setdefault((it["day"], it["period"]), []).append(it)
+    for (d, p), items in by_slot.items():
+        seen = {}
+        for it in items:
+            if it["subject"] in SPECIAL_ACTIVITIES or not it["teacher_name"]:
+                continue
+            seen[it["teacher_name"]] = seen.get(it["teacher_name"], 0) + 1
+        v["教員被り"] += sum(n - 1 for n in seen.values() if n > 1)
+        for subj, lim in prob.facility.items():
+            n = sum(1 for it in items if it["subject"] == subj)
+            if n > lim:
+                v["施設上限"] += n - lim
+    grid = {(it["class"], it["day"], it["period"]): it["subject"] for it in schedule}
+    for c in prob.classes:
+        for d in DAYS:
+            subs = [grid.get((c, d, p)) for p in PERIODS]
+            for a, b in zip(subs, subs[1:]):
+                if a and a == b:
+                    v["連続配置"] += 1
+            counts = {}
+            for s in subs:
+                if s and s not in SPECIAL_ACTIVITIES:
+                    counts[s] = counts.get(s, 0) + 1
+            v["同日重複"] += sum(n - 1 for n in counts.values() if n > 1)
+    return v
+
 
 @app.post("/optimize")
 def optimize_schedule(request: ScheduleRequest):
-    """
-    時間割最適化エンドポイント（v2.2.15・複数試行版）
-    
-    5回試行して、最も充填率が高い結果を返す
-    """
-    
     try:
-        # ========== データの正規化 ==========
-        normalized_teachers = []
-        for teacher in request.teachers:
-            try:
-                teacher_id = int(teacher.id) if isinstance(teacher.id, (int, float, str)) else None
-                if not teacher_id or teacher_id <= 0:
-                    print(f"DEBUG: 無効な教員ID: {teacher.id}, スキップ")
-                    continue
-                
-                classes = teacher.classes if isinstance(teacher.classes, list) else []
-                if isinstance(teacher.classes, str):
-                    classes = [c.strip() for c in teacher.classes.split(',') if c.strip()]
-                
-                if not classes:
-                    continue
-                
-                hours = int(teacher.hours) if isinstance(teacher.hours, (int, float, str)) else 0
-                if hours <= 0:
-                    continue
-                
-                normalized_teachers.append({
-                    'id': teacher_id,
-                    'name': teacher.name,
-                    'subject': teacher.subject,
-                    'classes': classes,
-                    'hours': hours
-                })
-            except Exception as e:
-                print(f"DEBUG: 教員データの正規化エラー: {e}, スキップ")
-                continue
-        
-        if not normalized_teachers:
-            return {
-                "schedule": [],
-                "status": "ERROR",
-                "message": "有効な教員データがありません"
-            }
-        
-        days = ["月", "火", "水", "木", "金"]
-        short_days = request.short_days or ["水"]
-        
-        # 全クラスを取得
-        all_classes = set()
-        for teacher in normalized_teachers:
-            all_classes.update(teacher['classes'])
-        all_classes = sorted(list(all_classes))
-        
-        # NG時間帯をセット化
-        ng_set = set()
-        for ng in request.ng_list or []:
-            if ng.target_type == "teacher":
-                ng_set.add((int(ng.target_id), ng.day, ng.period))
-        
-        # 施設上限を設定
-        facility_limits = request.facility_limits or {}
-        
-        # ★基礎5教科にもデフォルト施設上限を設定（GASから受け取らない場合の保険）
-        core_subjects_with_defaults = ['国語', '社会', '数学', '英語']
-        for subj in core_subjects_with_defaults:
-            if subj not in facility_limits:
-                facility_limits[subj] = 1  # 同じ限に1クラスまで
-        
-        # ★デバッグ用ログ
-        print(f"DEBUG: Received facility_limits = {request.facility_limits}")
-        print(f"DEBUG: Final facility_limits = {facility_limits}")
-        
-        # 学年一斉コマをセット化
-        group_slots_by_time = {}
-        for gs in request.group_slots or []:
-            key = (gs.grade, gs.day, gs.period)
-            group_slots_by_time[key] = gs.subject
-        
-        # ========== 複数回試行 ==========
-        print("DEBUG: ========== 複数回試行を開始 ==========")
-        
-        best_schedule = []
-        best_fill_rate = 0.0
-        best_violations = float('inf')  # ★違反数の初期値は無限大
-        
-        # ★試行回数を20回に増やす（違反0を見つける確率を上げる）
-        for trial in range(20):
-            print(f"DEBUG: 試行 {trial + 1}/20")
-            
-            schedule = optimize_schedule_single(
-                normalized_teachers,
-                ng_set,
-                facility_limits,
-                group_slots_by_time,
-                short_days
-            )
-            
-            fill_rate = calculate_fill_rate(schedule, all_classes, days, short_days)
-            
-            # ★制約違反をカウント
-            violation_count = count_violations(schedule, facility_limits, all_classes)
-            
-            print(f"DEBUG: 試行 {trial + 1} 充填率={fill_rate:.1%} 違反数={violation_count}")
-            
-            # ★規則第一：違反0を最優先
-            if violation_count == 0:
-                # 違反0の試行が見つかった
-                if best_violations == float('inf') or fill_rate > best_fill_rate:
-                    best_fill_rate = fill_rate
-                    best_violations = 0
-                    best_schedule = schedule
-                
-                # ★違反0を見つけたら、さらに2回試行して改善できるか確認
-                # （充填率をもう少し上げられるか試す）
-                if trial >= 2:  # 最低3回は試行する
-                    print(f"DEBUG: 違反0を発見。充填率={fill_rate:.1%}。さらに改善を試みます...")
-            else:
-                # 違反0がまだ見つかっていない場合のみ、違反が少ない方を更新
-                if best_violations == float('inf') or violation_count < best_violations:
-                    best_fill_rate = fill_rate
-                    best_violations = violation_count
-                    best_schedule = schedule
-                elif violation_count == best_violations and fill_rate > best_fill_rate:
-                    # 違反数が同じなら充填率で比較
-                    best_fill_rate = fill_rate
-                    best_schedule = schedule
-        
-        print(f"DEBUG: 最良試行の充填率={best_fill_rate:.1%} 違反数={best_violations} ({len(best_schedule)}コマ)")
-        
-        # ========== 空白埋め処理（安全版・必須コマ数を超えない） ==========
-        print("DEBUG: ========== 空白埋めを開始 ==========")
-        best_schedule = fill_gaps_safely(best_schedule, all_classes, days, short_days)
-        
-        final_fill_rate = calculate_fill_rate(best_schedule, all_classes, days, short_days)
-        print(f"DEBUG: 空白埋め後の充填率={final_fill_rate:.1%} ({len(best_schedule)}コマ)")
-        
+        prob = Problem(request)
+        if not prob.teachers:
+            return {"schedule": [], "status": "ERROR", "message": "有効な教員データがありません"}
+
+        budget = max(3.0, min(float(request.time_limit or 20.0), 25.0))
+        start = time.time()
+        deadline = start + budget
+        best, trials = None, 0
+        while time.time() < deadline:
+            trials += 1
+            st = build_one(prob, deadline)
+            if best is None or len(st.unplaced) < len(best.unplaced):
+                best = st
+                print(f"DEBUG: 試行{trials} 未配置 {len(st.unplaced)}")
+            if len(best.unplaced) <= prob.lower_bound:
+                break   # 原理的な下限に到達（これ以上は改善しない）
+
+        schedule = best.to_schedule()
+        violations = count_violations(schedule, prob)
+        total_slots = len(prob.slots) * len(prob.classes)
+        fill_rate = len(schedule) / total_slots if total_slots else 0.0
+
+        unplaced = [{"class": u["class"], "subject": u["subject"],
+                     "teacher_name": u["tname"], "reason": "制約により配置できず"}
+                    for u in best.unplaced] + prob.no_teacher
+        unplaced.sort(key=lambda x: (x["class"], x["subject"]))
+
+        msg = f"時間割生成完了: {len(schedule)}/{total_slots}コマ（充填率 {fill_rate:.1%}）"
+        if unplaced:
+            msg += f" / 未配置 {len(unplaced)}コマ"
+        print(f"DEBUG: {msg} 試行{trials}回 {time.time() - start:.1f}秒 違反={violations}")
+
         return {
-            "schedule": best_schedule,
-            "status": "SUCCESS",
-            "message": f"時間割生成完了: {len(best_schedule)}コマ配置（充填率: {final_fill_rate:.1%}）",
-            "fill_rate": final_fill_rate
+            "schedule": schedule,
+            "status": "SUCCESS" if not unplaced else "PARTIAL",
+            "message": msg,
+            "fill_rate": fill_rate,
+            "unplaced": unplaced,
+            "violations": violations,
+            "warnings": prob.warnings,
+            "notes": sorted(set(prob.notes)),
+            "lower_bound": prob.lower_bound,
+            "trials": trials,
+            "version": VERSION,
         }
-    
     except Exception as e:
-        print(f"ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
-        return {
-            "schedule": [],
-            "status": "ERROR",
-            "message": f"エラー: {str(e)}"
-        }
+        return {"schedule": [], "status": "ERROR", "message": f"エラー: {e}"}
+
 
 if __name__ == "__main__":
     import uvicorn
