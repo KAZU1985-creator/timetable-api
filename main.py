@@ -485,6 +485,10 @@ def fill_gaps_safely(schedule, all_classes, days, short_days):
         # 不足している教科を探す
         deficit_subjects = []
         for subject, required in required_subjects.items():
+            # ★特別活動は埋めない（学年一斉コマのみで配置）
+            if subject in SPECIAL_ACTIVITIES:
+                continue
+            
             current = current_counts.get(subject, 0)
             deficit = required - current
             
