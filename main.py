@@ -109,6 +109,9 @@ def optimize_schedule(request: ScheduleRequest):
                 subject_teachers[teacher.subject] = []
             
             # 教員が複数クラスを担当する場合、各クラスごとに分割
+            # ★重要★ 各クラスでの上限 = 総週コマ数 ÷ 担当クラス数
+            hours_per_class = teacher.hours // len(teacher.classes) if teacher.classes else teacher.hours
+            
             for class_name in teacher.classes:
                 subject_teachers[teacher.subject].append({
                     'id': teacher.id,
@@ -116,7 +119,8 @@ def optimize_schedule(request: ScheduleRequest):
                     'subject': teacher.subject,
                     'class': class_name,
                     'original_classes': teacher.classes,
-                    'total_hours': teacher.hours
+                    'total_hours': teacher.hours,  # 総時間数（表示・追跡用）
+                    'max_hours_this_class': hours_per_class  # このクラスでの上限 ★重要★
                 })
         
         print(f"DEBUG: subjects={list(subject_teachers.keys())}")
@@ -134,9 +138,12 @@ def optimize_schedule(request: ScheduleRequest):
                         class_timetable[class_name][day][period] = None
         
         # 教員の使用時間数を追跡
-        teacher_hours_used = {}
+        teacher_hours_used = {}  # teacher_id → 総時間数
+        teacher_class_hours_used = {}  # (teacher_id, class_name) → このクラスでの時間数
         for teacher in request.teachers:
             teacher_hours_used[teacher.id] = 0
+            for class_name in teacher.classes:
+                teacher_class_hours_used[(teacher.id, class_name)] = 0
         
         # NG時間帯をセット化
         ng_set = set()
@@ -183,7 +190,12 @@ def optimize_schedule(request: ScheduleRequest):
                             if (teacher_entry['id'], target_day, target_period) in ng_set:
                                 continue
                             
+                            # ★制約1: 総時間数の制限
                             if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
+                                continue
+                            
+                            # ★制約2: このクラスでの上限
+                            if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
                                 continue
                             
                             available_teacher = teacher_entry
@@ -192,6 +204,7 @@ def optimize_schedule(request: ScheduleRequest):
                     if available_teacher:
                         class_timetable[class_name][target_day][target_period] = f"{subject}|{available_teacher['name']}"
                         teacher_hours_used[available_teacher['id']] += 1
+                        teacher_class_hours_used[(available_teacher['id'], class_name)] += 1
                         placed_count += 1
                 
                 print(f"DEBUG: {class_name} {subject}={placed_count}（学年一斉コマのみ）")
@@ -277,7 +290,12 @@ def optimize_schedule(request: ScheduleRequest):
                                 if (teacher_entry['id'], day, period) in ng_set:
                                     continue
                                 
+                                # ★制約1: 総時間数の制限
                                 if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
+                                    continue
+                                
+                                # ★制約2: このクラスでの上限
+                                if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
                                     continue
                                 
                                 available_teacher = teacher_entry
@@ -286,6 +304,7 @@ def optimize_schedule(request: ScheduleRequest):
                         if available_teacher:
                             class_timetable[class_name][day][period] = f"{subject}|{available_teacher['name']}"
                             teacher_hours_used[available_teacher['id']] += 1
+                            teacher_class_hours_used[(available_teacher['id'], class_name)] += 1
                             placed = True
                             placed_count += 1
                             break
@@ -368,7 +387,12 @@ def optimize_schedule(request: ScheduleRequest):
                                 if (teacher_entry['id'], day, period) in ng_set:
                                     continue
                                 
+                                # ★制約1: 総時間数の制限
                                 if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
+                                    continue
+                                
+                                # ★制約2: このクラスでの上限
+                                if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
                                     continue
                                 
                                 available_teacher = teacher_entry
@@ -377,6 +401,7 @@ def optimize_schedule(request: ScheduleRequest):
                         if available_teacher:
                             class_timetable[class_name][day][period] = f"{subject}|{available_teacher['name']}"
                             teacher_hours_used[available_teacher['id']] += 1
+                            teacher_class_hours_used[(available_teacher['id'], class_name)] += 1
                             placed = True
                             placed_count += 1
                             break
