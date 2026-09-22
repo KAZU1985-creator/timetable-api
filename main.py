@@ -107,22 +107,20 @@ def try_place_subject(class_timetable, class_name, subject,
                 continue
             
             # ★同じ教員の複数クラスが同じ限に配置されていないかチェック
-            # （例：国語教員が1-1,1-2,1-3を担当している場合、
-            #  　3限に1-1国語と1-2国語が同時に配置されないように）
             same_teacher_same_period = False
             if subject in subject_teachers:
                 for teacher_entry in subject_teachers[subject]:
                     # この教員が複数クラスを担当しているか
-                    if len(teacher_entry['original_classes']) > 1:
+                    teacher_classes = teacher_entry.get('original_classes', [])
+                    if len(teacher_classes) > 1:
                         # この教員の別のクラスが同じ限に同じ教科を配置していないかチェック
-                        for other_class in teacher_entry['original_classes']:
+                        for other_class in teacher_classes:
                             if other_class == class_name:
                                 continue
-                            if class_timetable[other_class][day].get(period):
-                                other_slot_value = class_timetable[other_class][day].get(period)
-                                if other_slot_value != "BLOCKED" and subject in str(other_slot_value):
-                                    same_teacher_same_period = True
-                                    break
+                            other_slot = class_timetable[other_class][day].get(period)
+                            if other_slot and other_slot != "BLOCKED" and subject in str(other_slot):
+                                same_teacher_same_period = True
+                                break
                     if same_teacher_same_period:
                         break
             
