@@ -347,6 +347,38 @@ def optimize_schedule_single(normalized_teachers, ng_set, facility_limits, group
     
     return schedule
 
+def count_violations(schedule, facility_limits, all_classes):
+    """
+    制約違反の数をカウント
+    - 同じ限に同じ教科が複数クラス配置されている（facility_limits違反）
+    - 同じクラスで同じ教科が連続している（連続配置違反）
+    """
+    days = ["月", "火", "水", "木", "金"]
+    periods = [1, 2, 3, 4, 5, 6]
+    
+    violation_count = 0
+    
+    # 制約1：施設上限違反をカウント
+    for day in days:
+        for period in periods:
+            for subject, limit in facility_limits.items():
+                count = sum(1 for item in schedule 
+                           if item['day'] == day and item['period'] == period and item['subject'] == subject)
+                if count > limit:
+                    violation_count += (count - limit)
+    
+    # 制約2：連続配置違反をカウント
+    for class_name in all_classes:
+        for day in days:
+            for period in range(1, 6):  # 1-5限（6限の次はない）
+                item1 = next((x for x in schedule if x['class'] == class_name and x['day'] == day and x['period'] == period), None)
+                item2 = next((x for x in schedule if x['class'] == class_name and x['day'] == day and x['period'] == period + 1), None)
+                
+                if item1 and item2 and item1['subject'] == item2['subject']:
+                    violation_count += 1
+    
+    return violation_count
+
 def calculate_fill_rate(schedule, all_classes, days, short_days):
     """充填率を計算（0.0-1.0）"""
     total_possible = 0
@@ -449,6 +481,7 @@ def optimize_schedule(request: ScheduleRequest):
         
         best_schedule = []
         best_fill_rate = 0.0
+        best_violations = float('inf')  # ★違反数の初期値は無限大
         
         for trial in range(5):
             print(f"DEBUG: 試行 {trial + 1}/5")
@@ -462,13 +495,22 @@ def optimize_schedule(request: ScheduleRequest):
             )
             
             fill_rate = calculate_fill_rate(schedule, all_classes, days, short_days)
-            print(f"DEBUG: 試行 {trial + 1} 充填率={fill_rate:.1%} ({len(schedule)}コマ)")
             
-            if fill_rate > best_fill_rate:
+            # ★制約違反をカウント
+            violation_count = count_violations(schedule, facility_limits, all_classes)
+            
+            print(f"DEBUG: 試行 {trial + 1} 充填率={fill_rate:.1%} 違反数={violation_count}")
+            
+            # ★違反が少ない方 > 充填率が高い方 の優先順で選ぶ
+            is_better = (violation_count < best_violations) or \
+                       (violation_count == best_violations and fill_rate > best_fill_rate)
+            
+            if is_better:
                 best_fill_rate = fill_rate
+                best_violations = violation_count
                 best_schedule = schedule
         
-        print(f"DEBUG: 最良試行の充填率={best_fill_rate:.1%} ({len(best_schedule)}コマ)")
+        print(f"DEBUG: 最良試行の充填率={best_fill_rate:.1%} 違反数={best_violations} ({len(best_schedule)}コマ)")
         
         return {
             "schedule": best_schedule,
