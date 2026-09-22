@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ortools.sat.python import cp_model
 
-app = FastAPI(title="学校時間割最適化 API", version="2.2.0")
+app = FastAPI(title="学校時間割最適化 API", version="2.2.1")
 
 app.add_middleware(
     CORSMiddleware,
