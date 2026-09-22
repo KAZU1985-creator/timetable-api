@@ -453,7 +453,7 @@ def optimize_schedule(request: ScheduleRequest):
     """
     時間割最適化エンドポイント（v2.2.15・複数試行版）
     
-    5回試行して、最も充填率が高い結果を返す
+    20回試行して、違反0を最優先で選ぶ
     """
     
     try:
