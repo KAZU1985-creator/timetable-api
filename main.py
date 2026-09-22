@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 import random
 
-app = FastAPI(title="学校時間割最適化 API", version="2.2.13")
+app = FastAPI(title="学校時間割最適化 API", version="2.2.14")
 
 # ========== 教科マスタ（固定） ==========
 SUBJECT_MASTER = {
@@ -67,44 +67,32 @@ class ScheduleRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": "学校時間割最適化API v2.2.13（制度設計版）"}
+    return {"message": "学校時間割最適化API v2.2.14（木金優先・均等配置版）"}
+
+def sort_slots_by_day(valid_slots):
+    """
+    スロットを曜日で優先度付けしてソート
+    優先度: 金 > 木 > 水 > 火 > 月
+    """
+    day_priority = {"金": 5, "木": 4, "水": 3, "火": 2, "月": 1}
+    return sorted(valid_slots, key=lambda x: (-day_priority.get(x[0], 0), x[1]))
 
 @app.post("/optimize")
 def optimize_schedule(request: ScheduleRequest):
     """
-    時間割最適化エンドポイント（v2.2.13・制度設計版）
-    
-    制度設計：
-    - 教員が複数クラスを担当する場合、各クラスで個別に配置
-    - 例：教員1（国語・1-1,1-2,1-3）→ 3個の スケジュール対象
-    
-    優先順位：
-    1. 特別活動（道徳・学活・総合）→ 学年一斉で固定
-    2. 技能教科（保体・理科・音楽・美術・技術・家庭）→ 特別教室が限られている
-    3. 基礎5教科（国語・社会・数学・英語）→ 普通教室で自由に配置
-    
-    制約：
-    - 同一教科の連続配置を禁止
-    - 教員の週コマ数制限
-    - NG時間帯
-    - 施設上限
-    - 学年一斉コマ
-    - 1日1クラス1教科1コマ（特別活動を除く）
+    時間割最適化エンドポイント（v2.2.14・木金優先配置版）
     """
     
     try:
         # ========== データの正規化 ==========
-        # 教員データを再度バリデーション・正規化
         normalized_teachers = []
         for teacher in request.teachers:
             try:
-                # IDが有効な整数か確認
                 teacher_id = int(teacher.id) if isinstance(teacher.id, (int, float, str)) else None
                 if not teacher_id or teacher_id <= 0:
                     print(f"DEBUG: 無効な教員ID: {teacher.id}, スキップ")
                     continue
                 
-                # クラスが空でないか確認
                 classes = teacher.classes if isinstance(teacher.classes, list) else []
                 if isinstance(teacher.classes, str):
                     classes = [c.strip() for c in teacher.classes.split(',') if c.strip()]
@@ -113,7 +101,6 @@ def optimize_schedule(request: ScheduleRequest):
                     print(f"DEBUG: 教員{teacher.name}の担当クラスが空, スキップ")
                     continue
                 
-                # 週コマ数が有効か確認
                 hours = int(teacher.hours) if isinstance(teacher.hours, (int, float, str)) else 0
                 if hours <= 0:
                     print(f"DEBUG: 教員{teacher.name}の週コマ数が0以下: {hours}, スキップ")
@@ -138,20 +125,18 @@ def optimize_schedule(request: ScheduleRequest):
             }
         
         print(f"DEBUG: 正規化後の教員数: {len(normalized_teachers)}")
-        for t in normalized_teachers:
-            print(f"DEBUG: 教員 {t['name']} → 科目: {t['subject']}, クラス: {t['classes']}, 週コマ: {t['hours']}")
+        
         days = ["月", "火", "水", "木", "金"]
         periods = [1, 2, 3, 4, 5, 6]
         short_days = request.short_days or ["水"]
         
-        # 全クラスを取得（正規化済みデータから）
+        # 全クラスを取得
         all_classes = set()
         for teacher in normalized_teachers:
             all_classes.update(teacher['classes'])
         all_classes = sorted(list(all_classes))
         
-        print(f"DEBUG: classes={all_classes}")
-        print(f"DEBUG: num_classes={len(all_classes)}")
+        print(f"DEBUG: classes={all_classes}, num_classes={len(all_classes)}")
         
         # 教科別に教員を分類（各クラスごと）
         subject_teachers = {}
@@ -159,8 +144,6 @@ def optimize_schedule(request: ScheduleRequest):
             if teacher['subject'] not in subject_teachers:
                 subject_teachers[teacher['subject']] = []
             
-            # 教員が複数クラスを担当する場合、各クラスごとに分割
-            # ★重要★ 各クラスでの上限 = 総週コマ数 ÷ 担当クラス数
             hours_per_class = teacher['hours'] // len(teacher['classes']) if teacher['classes'] else teacher['hours']
             
             for class_name in teacher['classes']:
@@ -170,8 +153,8 @@ def optimize_schedule(request: ScheduleRequest):
                     'subject': teacher['subject'],
                     'class': class_name,
                     'original_classes': teacher['classes'],
-                    'total_hours': teacher['hours'],  # 総時間数（表示・追跡用）
-                    'max_hours_this_class': hours_per_class  # このクラスでの上限 ★重要★
+                    'total_hours': teacher['hours'],
+                    'max_hours_this_class': hours_per_class
                 })
         
         print(f"DEBUG: subjects={list(subject_teachers.keys())}")
@@ -189,8 +172,8 @@ def optimize_schedule(request: ScheduleRequest):
                         class_timetable[class_name][day][period] = None
         
         # 教員の使用時間数を追跡
-        teacher_hours_used = {}  # teacher_id → 総時間数
-        teacher_class_hours_used = {}  # (teacher_id, class_name) → このクラスでの時間数
+        teacher_hours_used = {}
+        teacher_class_hours_used = {}
         for teacher in normalized_teachers:
             teacher_hours_used[teacher['id']] = 0
             for class_name in teacher['classes']:
@@ -241,11 +224,9 @@ def optimize_schedule(request: ScheduleRequest):
                             if (teacher_entry['id'], target_day, target_period) in ng_set:
                                 continue
                             
-                            # ★制約1: 総時間数の制限
                             if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
                                 continue
                             
-                            # ★制約2: このクラスでの上限
                             if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
                                 continue
                             
@@ -328,6 +309,8 @@ def optimize_schedule(request: ScheduleRequest):
                         print(f"DEBUG: {class_name} {subject}: 有効なスロットなし")
                         break
                     
+                    # ★★★ 木金優先：曜日でソートして、その中でランダム
+                    valid_slots = sort_slots_by_day(valid_slots)
                     random.shuffle(valid_slots)
                     
                     placed = False
@@ -341,11 +324,9 @@ def optimize_schedule(request: ScheduleRequest):
                                 if (teacher_entry['id'], day, period) in ng_set:
                                     continue
                                 
-                                # ★制約1: 総時間数の制限
                                 if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
                                     continue
                                 
-                                # ★制約2: このクラスでの上限
                                 if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
                                     continue
                                 
@@ -425,6 +406,8 @@ def optimize_schedule(request: ScheduleRequest):
                         print(f"DEBUG: {class_name} {subject}: 有効なスロットなし")
                         break
                     
+                    # ★★★ 木金優先：曜日でソートして、その中でランダム
+                    valid_slots = sort_slots_by_day(valid_slots)
                     random.shuffle(valid_slots)
                     
                     placed = False
@@ -438,11 +421,9 @@ def optimize_schedule(request: ScheduleRequest):
                                 if (teacher_entry['id'], day, period) in ng_set:
                                     continue
                                 
-                                # ★制約1: 総時間数の制限
                                 if teacher_hours_used[teacher_entry['id']] >= teacher_entry['total_hours']:
                                     continue
                                 
-                                # ★制約2: このクラスでの上限
                                 if teacher_class_hours_used[(teacher_entry['id'], class_name)] >= teacher_entry['max_hours_this_class']:
                                     continue
                                 
@@ -489,15 +470,13 @@ def optimize_schedule(request: ScheduleRequest):
                     subject_counts[subj] = subject_counts.get(subj, 0) + 1
             print(f"DEBUG: {class_name}={subject_counts}")
         
-        print(f"DEBUG: total_schedule={len(schedule)}")
-        
-        # 教員ごとの配置コマ数をサマリー
-        teacher_summary = {}
+        # 曜日ごとの配置コマ数
+        day_counts = {day: 0 for day in days}
         for item in schedule:
-            teacher_name = item.get('teacher_name', 'unknown')
-            teacher_summary[teacher_name] = teacher_summary.get(teacher_name, 0) + 1
+            day_counts[item["day"]] += 1
+        print(f"DEBUG: 曜日別配置コマ数={day_counts}")
         
-        print(f"DEBUG: 教員別配置コマ数: {teacher_summary}")
+        print(f"DEBUG: total_schedule={len(schedule)}")
         
         return {
             "schedule": schedule,
