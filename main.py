@@ -4,7 +4,14 @@ from typing import List, Optional, Dict
 from ortools.sat.python import cp_model
 import json
 
-app = FastAPI(title="学校時間割最適化 API", version="2.2.8")
+app = FastAPI(title="学校時間割最適化 API", version="2.2.9")
+
+# ========== 教科マスタ（固定） ==========
+SUBJECT_MASTER = {
+    '1年': {'国語': 4, '社会': 4, '数学': 4, '理科': 3, '英語': 3, '音楽': 1, '美術': 1, '保体': 1, '技術': 1, '家庭': 1, '学活': 1, '総合': 1, '道徳': 1},
+    '2年': {'国語': 4, '社会': 4, '数学': 4, '理科': 3, '英語': 3, '音楽': 1, '美術': 1, '保体': 1, '技術': 1, '家庭': 1, '学活': 1, '総合': 1, '道徳': 1},
+    '3年': {'国語': 4, '社会': 4, '数学': 4, '理科': 3, '英語': 3, '音楽': 1, '美術': 1, '保体': 1, '技術': 1, '家庭': 1, '学活': 1, '総合': 1, '道徳': 1},
+}
 
 class TeacherAssignment(BaseModel):
     id: int
@@ -46,17 +53,17 @@ class Schedule(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": "学校時間割最適化API v2.2.8"}
+    return {"message": "学校時間割最適化API v2.2.9"}
 
 @app.post("/optimize")
 def optimize_schedule(request: ScheduleRequest):
     """
     時間割最適化エンドポイント
     
-    修正内容（v2.2.8）:
-    - スケジューリングロジックを完全に再実装
-    - 各クラスの必要教科を明確に設定
-    - 教員の時間を厳密に管理
+    修正内容（v2.2.9）:
+    - 同一教科の連続配置を禁止
+    - 各クラスの教科の多様性を確保
+    - 教科マスタに基づいた配置コマ数の厳密な管理
     """
     
     try:
@@ -84,6 +91,19 @@ def optimize_schedule(request: ScheduleRequest):
             subject_teachers[teacher.subject].append(teacher)
         
         print(f"DEBUG: subject_teachers={list(subject_teachers.keys())}")
+        
+        # 各クラスの必要教科コマ数を計算
+        class_subject_hours = {}
+        for class_name in all_classes:
+            grade_match = class_name[0]  # "1-1" -> "1"
+            grade_key = f"{grade_match}年"
+            
+            if grade_key in SUBJECT_MASTER:
+                class_subject_hours[class_name] = SUBJECT_MASTER[grade_key].copy()
+            else:
+                class_subject_hours[class_name] = {}
+        
+        print(f"DEBUG: class_subject_hours={class_subject_hours}")
         
         # CP-SAT モデル作成
         model = cp_model.CpModel()
@@ -121,7 +141,43 @@ def optimize_schedule(request: ScheduleRequest):
                     if slot_vars:
                         model.Add(sum(slot_vars) == 1)
         
-        # ========== 制約2: 各教員の週コマ数制限 ==========
+        # ========== 制約2: 各教科の必要コマ数 ==========
+        for class_name in all_classes:
+            for subject, required_hours in class_subject_hours[class_name].items():
+                subject_vars = [
+                    var for key, var in assignment_vars.items()
+                    if key.startswith(f"{class_name}_") and f"_{subject}_" in key
+                ]
+                
+                if subject_vars and required_hours > 0:
+                    model.Add(sum(subject_vars) == required_hours)
+        
+        # ========== 制約3: 同一教科の連続配置を禁止 ==========
+        for class_name in all_classes:
+            for day in days:
+                for period in range(1, 6):  # 6番目の時限の場合は5番目を見ない（6限がない場合もあるため）
+                    if day in short_days and period == 6:
+                        continue
+                    
+                    current_slot_vars = {}
+                    next_slot_vars = {}
+                    
+                    for key, var in assignment_vars.items():
+                        if key.startswith(f"{class_name}_{day}_{period}_"):
+                            # subject_teacherを抽出
+                            parts = key.split("_")
+                            subject = parts[3]
+                            current_slot_vars[subject] = var
+                        elif key.startswith(f"{class_name}_{day}_{period + 1}_"):
+                            parts = key.split("_")
+                            subject = parts[3]
+                            next_slot_vars[subject] = var
+                    
+                    # 同じ教科なら両方が1にはならない
+                    for subject in set(current_slot_vars.keys()) & set(next_slot_vars.keys()):
+                        model.Add(current_slot_vars[subject] + next_slot_vars[subject] <= 1)
+        
+        # ========== 制約4: 各教員の週コマ数制限 ==========
         for teacher in request.teachers:
             teacher_vars = [
                 var for key, var in assignment_vars.items()
@@ -131,20 +187,7 @@ def optimize_schedule(request: ScheduleRequest):
             if teacher_vars:
                 model.Add(sum(teacher_vars) <= teacher.hours)
         
-        # ========== 制約3: 教員の日単位の最大連続授業制限 ==========
-        max_consecutive = request.max_consecutive or 4
-        for teacher in request.teachers:
-            for day in days:
-                day_vars = [
-                    var for key, var in assignment_vars.items()
-                    if f"_{day}_" in key and f"_{teacher.id}" in key
-                ]
-                
-                if len(day_vars) > max_consecutive:
-                    for i in range(len(day_vars) - max_consecutive + 1):
-                        model.Add(sum(day_vars[i:i+max_consecutive]) <= max_consecutive - 1)
-        
-        # ========== 制約4: NG時間帯 ==========
+        # ========== 制約5: NG時間帯 ==========
         for ng in request.ng_list or []:
             if ng.target_type == "teacher":
                 teacher_id = int(ng.target_id)
@@ -159,7 +202,7 @@ def optimize_schedule(request: ScheduleRequest):
                 for var in ng_vars:
                     model.Add(var == 0)
         
-        # ========== 制約5: 施設上限 ==========
+        # ========== 制約6: 施設上限 ==========
         facility_limits = request.facility_limits or {}
         for facility, limit in facility_limits.items():
             for day in days:
@@ -175,7 +218,7 @@ def optimize_schedule(request: ScheduleRequest):
                     if facility_vars:
                         model.Add(sum(facility_vars) <= limit)
         
-        # ========== 制約6: 学年一斉コマ ==========
+        # ========== 制約7: 学年一斉コマ ==========
         for group_slot in request.group_slots or []:
             grade = group_slot.grade
             day = group_slot.day
@@ -234,6 +277,15 @@ def optimize_schedule(request: ScheduleRequest):
                     "teacher_id": teacher_id
                 })
         
+        # クラスごとの教科統計を出力
+        for class_name in all_classes:
+            subject_counts = {}
+            for item in schedule:
+                if item["class"] == class_name:
+                    subj = item["subject"]
+                    subject_counts[subj] = subject_counts.get(subj, 0) + 1
+            print(f"DEBUG: {class_name}={subject_counts}")
+        
         print(f"DEBUG: generated_schedule_count={len(schedule)}")
         
         return {
@@ -244,6 +296,8 @@ def optimize_schedule(request: ScheduleRequest):
     
     except Exception as e:
         print(f"ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
             "schedule": [],
             "status": "ERROR",
