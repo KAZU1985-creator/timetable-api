@@ -1,5 +1,11 @@
 """
-学校時間割最適化 API v2.3.1
+学校時間割最適化 API v2.4.0
+
+v2.4.0 の変更
+  ・隔週コマ（交互コマ）に対応：教科名を「音楽/美術」のように / でつなぐと、
+    1つのコマを2教科で分け合う（隔週・前期後期など）。そのコマは両方の先生・両方の施設を確保し、
+    同じ日に音楽（または美術）の授業とは重ねない
+
 
 v2.3.1 の変更
   ・先生を「教員ID」ではなく「教員名」で識別（2教科を持つ先生＝教員設定で2行でも同一人物として扱う）
@@ -33,7 +39,7 @@ from typing import List, Optional, Dict, Tuple
 import random
 import time
 
-VERSION = "2.3.1"
+VERSION = "2.4.0"
 app = FastAPI(title="学校時間割最適化 API", version=VERSION)
 
 DAYS = ["月", "火", "水", "木", "金"]
@@ -112,6 +118,12 @@ def teacher_key(name: str) -> str:
     return "".join(str(name or "").split())
 
 
+def components(subject: str) -> List[str]:
+    """隔週コマ「音楽/美術」→ ['音楽', '美術']、通常の教科はそのまま1つ"""
+    parts = [x.strip() for x in str(subject or "").split("/") if x.strip()]
+    return parts if parts else [str(subject or "")]
+
+
 def grade_of(class_name: str) -> str:
     """'1-2' → '1年'"""
     return f"{str(class_name).strip()[0]}年"
@@ -170,7 +182,7 @@ class Problem:
             self.special_teacher[(st.subject.strip(), st.class_name.strip())] = (key, st.teacher_name.strip())
 
         # 配置すべき授業（1コマ = 1ユニット）
-        self.units = []           # dict(class, subject, tkey, tname)
+        self.units = []           # dict(class, subject, tkeys, tname)
         self.no_teacher = []      # 担当教員が見つからない授業
         for c in self.classes:
             g = grade_of(c)
@@ -182,16 +194,14 @@ class Problem:
             for subj, hours in need.items():
                 if subj in SPECIAL_ACTIVITIES or hours <= 0:
                     continue
-                teacher = next((t for t in self.teachers
-                                if t["subject"] == subj and c in t["classes"]), None)
-                if teacher is None:
+                tkeys, tnames, missing = self.resolve_teachers(subj, c)
+                if missing:
                     for _ in range(hours):
                         self.no_teacher.append({"class": c, "subject": subj,
-                                                "reason": "担当教員が未設定"})
+                                                "reason": f"担当教員が未設定（{'・'.join(missing)}）"})
                     continue
                 for _ in range(hours):
-                    self.units.append({"class": c, "subject": subj,
-                                       "tkey": teacher_key(teacher["name"]), "tname": teacher["name"]})
+                    self.units.append({"class": c, "subject": subj, "tkeys": tkeys, "tname": "・".join(tnames)})
 
         # ===== 固定コマ（手で決めた授業）=====
         # 学年一斉コマと重なるもの・枠外のものは除外し、その分の授業ユニットを減らす
@@ -203,10 +213,11 @@ class Problem:
                 continue
             if subj in SPECIAL_ACTIVITIES:
                 tkey, tname = self.special_teacher.get((subj, c), (None, ""))
+                tkeys = [tkey] if tkey else []
             else:
-                t = next((t for t in self.teachers if t["subject"] == subj and c in t["classes"]), None)
-                tkey, tname = (teacher_key(t["name"]), t["name"]) if t else (None, "")
-            self.fixed.append({"class": c, "subject": subj, "tkey": tkey, "tname": tname, "slot": (d, p)})
+                tkeys, tnames, _ = self.resolve_teachers(subj, c)
+                tname = "・".join(tnames)
+            self.fixed.append({"class": c, "subject": subj, "tkeys": tkeys, "tname": tname, "slot": (d, p)})
             idx = next((i for i, u in enumerate(self.units) if u["class"] == c and u["subject"] == subj), None)
             if idx is not None:
                 self.units.pop(idx)
@@ -214,7 +225,8 @@ class Problem:
         # 先生ごとの担当コマ数（配置の優先度に使う）
         load = {}
         for u in self.units:
-            load[u["tkey"]] = load.get(u["tkey"], 0) + 1
+            for k in u["tkeys"]:
+                load[k] = load.get(k, 0) + 1
         self.teacher_load = load
 
         # ===== 事前チェック：原理的に置けないコマ数（下限）を計算 =====
@@ -236,10 +248,10 @@ class Problem:
                 self.notes.append(f"{c}: 教科マスタの合計が週コマ数より {capacity - n_units} 少ないため、その分は空欄になります")
 
         for subj, lim in self.facility.items():
-            need = sum(1 for u in self.units if u["subject"] == subj)
+            need = sum(1 for u in self.units if subj in components(u["subject"]))
             if need == 0:
                 continue
-            need_classes = {u["class"] for u in self.units if u["subject"] == subj}
+            need_classes = {u["class"] for u in self.units if subj in components(u["subject"])}
             cap = sum(min(lim, sum(1 for c in need_classes if (c, d, p) not in blocked))
                       for (d, p) in self.slots)
             if need > cap:
@@ -247,6 +259,21 @@ class Problem:
                 self.warnings.append(
                     f"{subj}: 全クラスで週 {need} コマ必要ですが、施設上限 {lim} では最大 {cap} コマしか置けません"
                     f"（{need - cap} コマは必ず不足。施設上限か教科マスタを見直してください）")
+
+
+    def resolve_teachers(self, subj, c):
+        """教科（隔週コマなら各教科）の担当者 → (キーのリスト, 名前のリスト, 担当がいない教科)"""
+        keys, names, missing = [], [], []
+        for comp in components(subj):
+            t = next((t for t in self.teachers if t["subject"] == comp and c in t["classes"]), None)
+            if t is None:
+                missing.append(comp)
+                continue
+            k = teacher_key(t["name"])
+            if k not in keys:
+                keys.append(k)
+                names.append(t["name"])
+        return keys, names, missing
 
 
 # ========== 1回分の時間割（状態） ==========
@@ -266,11 +293,12 @@ class State:
         if logging:
             self.log.append(("put", c, slot))
         self.cell[c][slot] = dict(u, fixed=fixed)
-        if u["tkey"] is not None:
-            self.busy[(u["tkey"], d, p)] = c
-        self.fac[(u["subject"], d, p)] = self.fac.get((u["subject"], d, p), 0) + 1
-        k = (c, d, u["subject"])
-        self.daycnt[k] = self.daycnt.get(k, 0) + 1
+        for tk in u["tkeys"]:
+            self.busy[(tk, d, p)] = c
+        for comp in components(u["subject"]):          # 隔週コマは両方の教科・施設を使う
+            self.fac[(comp, d, p)] = self.fac.get((comp, d, p), 0) + 1
+            k = (c, d, comp)
+            self.daycnt[k] = self.daycnt.get(k, 0) + 1
 
     def _take(self, c, slot, logging=True):
         d, p = slot
@@ -278,10 +306,12 @@ class State:
         if logging:
             self.log.append(("take", c, slot, u))
         self.cell[c][slot] = None
-        if u["tkey"] is not None and self.busy.get((u["tkey"], d, p)) == c:
-            del self.busy[(u["tkey"], d, p)]
-        self.fac[(u["subject"], d, p)] -= 1
-        self.daycnt[(c, d, u["subject"])] -= 1
+        for tk in u["tkeys"]:
+            if self.busy.get((tk, d, p)) == c:
+                del self.busy[(tk, d, p)]
+        for comp in components(u["subject"]):
+            self.fac[(comp, d, p)] -= 1
+            self.daycnt[(c, d, comp)] -= 1
         return {k: v for k, v in u.items() if k != "fixed"}
 
     def rollback(self, mark):
@@ -298,21 +328,24 @@ class State:
     # ---- 制約チェック ----
     def ok_except_occupancy(self, u, slot, ignore_teacher=False):
         """セルの空き以外の制約（教員・NG・同日・連続・施設）を満たすか"""
-        c, s, t = u["class"], u["subject"], u["tkey"]
+        c, s = u["class"], u["subject"]
         d, p = slot
-        if (t, d, p) in self.P.ng:
-            return False
-        if not ignore_teacher and (t, d, p) in self.busy:
-            return False
-        if self.daycnt.get((c, d, s), 0) > 0:          # 同じ日に同じ教科は1コマまで
-            return False
+        comps = components(s)
+        for t in u["tkeys"]:
+            if (t, d, p) in self.P.ng:
+                return False
+            if not ignore_teacher and (t, d, p) in self.busy:
+                return False
+        for comp in comps:
+            if self.daycnt.get((c, d, comp), 0) > 0:     # 同じ日に同じ教科は1コマまで（隔週コマの各教科も）
+                return False
+            lim = self.P.facility.get(comp)
+            if lim is not None and self.fac.get((comp, d, p), 0) >= lim:
+                return False
         for q in (p - 1, p + 1):                       # 連続禁止（同日制限の保険）
             n = self.cell[c].get((d, q))
-            if n and n["subject"] == s:
+            if n and set(components(n["subject"])) & set(comps):
                 return False
-        lim = self.P.facility.get(s)
-        if lim is not None and self.fac.get((s, d, p), 0) >= lim:
-            return False
         return True
 
     def can_place(self, u, slot):
@@ -327,7 +360,7 @@ class State:
                 if grade_of(c) != g or self.cell[c][(d, p)] is not None:
                     continue
                 tkey, tname = self.P.special_teacher.get((subj, c), (None, ""))
-                self._put({"class": c, "subject": subj, "tkey": tkey, "tname": tname},
+                self._put({"class": c, "subject": subj, "tkeys": [tkey] if tkey else [], "tname": tname},
                           c, (d, p), fixed=True)
 
     # ---- 固定コマ（手で決めた授業。制約チェックなしでそのまま置く）----
@@ -336,7 +369,7 @@ class State:
             c, slot = f["class"], f["slot"]
             if self.cell[c][slot] is not None:
                 continue
-            u = {k: f[k] for k in ("class", "subject", "tkey", "tname")}
+            u = {k: f[k] for k in ("class", "subject", "tkeys", "tname")}
             self._put(u, c, slot, fixed=True)
 
     # ---- 貪欲配置 ----
@@ -368,21 +401,30 @@ class State:
             if occ is not None and occ["fixed"]:
                 continue
             d, p = s
-            # このコマで u の先生が他クラスを教えている場合、その授業もどかす
-            other_c = self.busy.get((u["tkey"], d, p))
-            if other_c is not None and other_c != c:
-                oc = self.cell[other_c][s]
-                if oc is None or oc["fixed"] or (other_c, s) in tabu:
+            # このコマで u の先生（隔週コマなら両方）が他クラスを教えている場合、その授業もどかす
+            others = []
+            blocked = False
+            for tk in u["tkeys"]:
+                oc_name = self.busy.get((tk, d, p))
+                if oc_name is None or oc_name == c or oc_name in others:
                     continue
-            if occ is None and other_c is None:
+                oc = self.cell[oc_name][s]
+                if oc is None or oc["fixed"] or (oc_name, s) in tabu:
+                    blocked = True
+                    break
+                others.append(oc_name)
+            if blocked:
+                continue
+            if occ is None and not others:
                 continue  # 空いていて先生も空き → 別の制約で置けないコマ
 
             mark = len(self.log)
             removed = []
             if occ is not None:
                 removed.append((c, s, self._take(c, s)))
-            if other_c is not None and other_c != c:
-                removed.append((other_c, s, self._take(other_c, s)))
+            for oc_name in others:
+                if self.cell[oc_name][s] is not None:
+                    removed.append((oc_name, s, self._take(oc_name, s)))
 
             if self.can_place(u, s):
                 self._put(u, c, s)
@@ -412,7 +454,8 @@ class State:
                 v = self.cell[c][(d, p)]
                 if v:
                     out.append({"class": c, "day": d, "period": p,
-                                "subject": v["subject"], "teacher_name": v["tname"]})
+                                "subject": v["subject"], "teacher_name": v["tname"],
+                                "teacher_keys": list(v["tkeys"])})
         return out
 
 
@@ -424,7 +467,7 @@ def build_one(prob: Problem, deadline: float) -> State:
     random.shuffle(units)
     # 施設上限のある教科 → 担当コマの多い先生 の順に先に置く（揺らぎ付き）
     units.sort(key=lambda u: (u["subject"] not in prob.facility,
-                              -prob.teacher_load[u["tkey"]] + random.random() * 3))
+                              -max([prob.teacher_load.get(k, 0) for k in u["tkeys"]] or [0]) + random.random() * 3))
     st.greedy(units)
     st.log.clear()
     st.repair(deadline)
@@ -440,12 +483,14 @@ def count_violations(schedule, prob: Problem):
     for (d, p), items in by_slot.items():
         seen = {}
         for it in items:
-            if it["subject"] in SPECIAL_ACTIVITIES or not it["teacher_name"]:
+            if it["subject"] in SPECIAL_ACTIVITIES:
                 continue
-            seen[it["teacher_name"]] = seen.get(it["teacher_name"], 0) + 1
+            keys = it.get("teacher_keys") or ([teacher_key(it["teacher_name"])] if it["teacher_name"] else [])
+            for k in keys:
+                seen[k] = seen.get(k, 0) + 1
         v["教員被り"] += sum(n - 1 for n in seen.values() if n > 1)
         for subj, lim in prob.facility.items():
-            n = sum(1 for it in items if it["subject"] == subj)
+            n = sum(1 for it in items if subj in components(it["subject"]))
             if n > lim:
                 v["施設上限"] += n - lim
     grid = {(it["class"], it["day"], it["period"]): it["subject"] for it in schedule}
@@ -453,12 +498,13 @@ def count_violations(schedule, prob: Problem):
         for d in DAYS:
             subs = [grid.get((c, d, p)) for p in PERIODS]
             for a, b in zip(subs, subs[1:]):
-                if a and a == b:
+                if a and b and set(components(a)) & set(components(b)):
                     v["連続配置"] += 1
             counts = {}
             for s in subs:
                 if s and s not in SPECIAL_ACTIVITIES:
-                    counts[s] = counts.get(s, 0) + 1
+                    for comp in components(s):
+                        counts[comp] = counts.get(comp, 0) + 1
             v["同日重複"] += sum(n - 1 for n in counts.values() if n > 1)
     return v
 
