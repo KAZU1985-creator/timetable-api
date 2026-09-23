@@ -1,5 +1,16 @@
 """
-学校時間割最適化 API v2.5.0
+⭐時間割作成プロジェクト⭐　時間割作成API
+PRODUCED BY 矢野校務
+© 2026 矢野校務  All rights reserved.
+
+本プログラムの著作権は矢野校務に帰属します。著作権者の許可なく、複製・改変・再配布・販売・公開すること、
+および本著作権表示を削除・変更することを禁じます。
+
+学校時間割最適化 API v2.5.1
+
+v2.5.1 の変更
+  ・著作権表示を追加（トップページにも表示）。時間割の作り方は v2.5.0 と同じ
+
 
 v2.5.0 の変更
   ・月曜の祝日対策：週1コマの教科（音楽・美術・技術・家庭・隔週コマなど）は、できるだけ月曜以外に置く
@@ -46,8 +57,8 @@ from typing import List, Optional, Dict, Tuple
 import random
 import time
 
-VERSION = "2.5.0"
-app = FastAPI(title="学校時間割最適化 API", version=VERSION)
+VERSION = "2.5.1"
+app = FastAPI(title="時間割作成プロジェクト API（PRODUCED BY 矢野校務）", version=VERSION)
 
 DAYS = ["月", "火", "水", "木", "金"]
 PERIODS = [1, 2, 3, 4, 5, 6]
@@ -118,7 +129,9 @@ class ScheduleRequest(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": f"学校時間割最適化API v{VERSION}（固定コマ対応 + 押し出し修復版）"}
+    return {"message": f"学校時間割最適化API v{VERSION}（固定コマ対応 + 押し出し修復版）",
+            "copyright": "© 2026 矢野校務 All rights reserved.",
+            "produced_by": "矢野校務"}
 
 
 def teacher_key(name: str) -> str:
