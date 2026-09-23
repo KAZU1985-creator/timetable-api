@@ -1,5 +1,12 @@
 """
-学校時間割最適化 API v2.4.0
+学校時間割最適化 API v2.5.0
+
+v2.5.0 の変更
+  ・月曜の祝日対策：週1コマの教科（音楽・美術・技術・家庭・隔週コマなど）は、できるだけ月曜以外に置く
+    （ハッピーマンデーで月曜は年間の授業日が少ないため。置き場所がなければ月曜にも置く）
+  ・道徳・学活・総合の連続は違反に数えない（総合2時間続きなど）
+  ・レスポンスに monday_single（月曜に入った週1コマの数）を追加
+
 
 v2.4.0 の変更
   ・隔週コマ（交互コマ）に対応：教科名を「音楽/美術」のように / でつなぐと、
@@ -39,7 +46,7 @@ from typing import List, Optional, Dict, Tuple
 import random
 import time
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 app = FastAPI(title="学校時間割最適化 API", version=VERSION)
 
 DAYS = ["月", "火", "水", "木", "金"]
@@ -100,6 +107,7 @@ class ScheduleRequest(BaseModel):
     special_teachers: Optional[List[SpecialTeacher]] = []
     subject_hours: Optional[Dict[str, Dict[str, int]]] = None
     fixed_lessons: Optional[List[FixedLesson]] = []
+    avoid_monday_single: Optional[bool] = True
     facility_limits: Optional[Dict[str, int]] = {}
     require_full: Optional[bool] = True
     max_consecutive: Optional[int] = 4
@@ -134,6 +142,7 @@ class Problem:
     def __init__(self, req: ScheduleRequest):
         self.warnings: List[str] = []
         self.short_days = req.short_days if req.short_days else ["水"]
+        self.avoid_monday = getattr(req, "avoid_monday_single", True) is not False
         self.master = req.subject_hours or DEFAULT_SUBJECT_MASTER
 
         # 施設上限：送られてきた教科だけ（基礎教科のデフォルト上限は付けない）
@@ -200,8 +209,10 @@ class Problem:
                         self.no_teacher.append({"class": c, "subject": subj,
                                                 "reason": f"担当教員が未設定（{'・'.join(missing)}）"})
                     continue
+                avoid_mon = self.avoid_monday and hours <= 1     # 週1コマの教科は月曜を避ける
                 for _ in range(hours):
-                    self.units.append({"class": c, "subject": subj, "tkeys": tkeys, "tname": "・".join(tnames)})
+                    self.units.append({"class": c, "subject": subj, "tkeys": tkeys, "tname": "・".join(tnames),
+                                       "avoid_mon": avoid_mon})
 
         # ===== 固定コマ（手で決めた授業）=====
         # 学年一斉コマと重なるもの・枠外のものは除外し、その分の授業ユニットを減らす
@@ -376,6 +387,10 @@ class State:
     def greedy(self, units):
         for u in units:
             cands = [s for s in self.P.slots if self.can_place(u, s)]
+            if u.get("avoid_mon"):
+                not_mon = [s for s in cands if s[0] != "月"]
+                if not_mon:
+                    cands = not_mon
             if cands:
                 self._put(u, u["class"], random.choice(cands))
             else:
@@ -387,6 +402,8 @@ class State:
         c = u["class"]
         slots = list(self.P.slots)
         random.shuffle(slots)
+        if u.get("avoid_mon"):
+            slots.sort(key=lambda sl: sl[0] == "月")   # 月曜は最後に試す
         for s in slots:
             if self.can_place(u, s):
                 self._put(u, c, s)
@@ -446,6 +463,47 @@ class State:
                 self.log.clear()   # 確定した分のログは不要
             self.unplaced = rest
 
+    def improve_monday(self, deadline):
+        """仕上げ：月曜に入った週1コマの授業を、別の曜日の授業と入れ替える／空きへ移す"""
+        for c in self.P.classes:
+            mondays = [sl for sl in self.P.slots if sl[0] == "月"]
+            for sm in mondays:
+                if time.time() > deadline:
+                    return
+                u = self.cell[c][sm]
+                if not u or u["fixed"] or not u.get("avoid_mon"):
+                    continue
+                others = [sl for sl in self.P.slots if sl[0] != "月"]
+                random.shuffle(others)
+                done = False
+                for so in others:
+                    v = self.cell[c][so]
+                    if v is not None and (v["fixed"] or v.get("avoid_mon")):
+                        continue
+                    mark = len(self.log)
+                    uu = self._take(c, sm)
+                    vv = self._take(c, so) if v is not None else None
+                    if self.can_place(uu, so) and (vv is None or self.can_place(vv, sm)):
+                        self._put(uu, c, so)
+                        if vv is not None:
+                            if self.can_place(vv, sm):
+                                self._put(vv, c, sm)
+                                done = True
+                            else:
+                                self.rollback(mark)
+                        else:
+                            done = True
+                    else:
+                        self.rollback(mark)
+                    if done:
+                        break
+                self.log.clear()
+
+    def monday_single(self):
+        """月曜に入った「週1コマの教科」の数（少ないほど良い）"""
+        return sum(1 for c in self.P.classes for (d, p), v in self.cell[c].items()
+                   if d == "月" and v and v.get("avoid_mon"))
+
     # ---- 出力 ----
     def to_schedule(self):
         out = []
@@ -471,6 +529,8 @@ def build_one(prob: Problem, deadline: float) -> State:
     st.greedy(units)
     st.log.clear()
     st.repair(deadline)
+    if prob.avoid_monday:
+        st.improve_monday(deadline)
     return st
 
 
@@ -498,7 +558,7 @@ def count_violations(schedule, prob: Problem):
         for d in DAYS:
             subs = [grid.get((c, d, p)) for p in PERIODS]
             for a, b in zip(subs, subs[1:]):
-                if a and b and set(components(a)) & set(components(b)):
+                if a and b and a not in SPECIAL_ACTIVITIES and set(components(a)) & set(components(b)):
                     v["連続配置"] += 1
             counts = {}
             for s in subs:
@@ -523,7 +583,7 @@ def optimize_schedule(request: ScheduleRequest):
         while time.time() < deadline:
             trials += 1
             st = build_one(prob, deadline)
-            if best is None or len(st.unplaced) < len(best.unplaced):
+            if best is None or (len(st.unplaced), st.monday_single()) < (len(best.unplaced), best.monday_single()):
                 best = st
                 print(f"DEBUG: 試行{trials} 未配置 {len(st.unplaced)}")
             if len(best.unplaced) <= prob.lower_bound:
@@ -555,6 +615,7 @@ def optimize_schedule(request: ScheduleRequest):
             "notes": sorted(set(prob.notes)),
             "lower_bound": prob.lower_bound,
             "trials": trials,
+            "monday_single": best.monday_single(),
             "version": VERSION,
         }
     except Exception as e:
